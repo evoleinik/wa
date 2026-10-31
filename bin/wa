@@ -40,6 +40,7 @@ VERSION = "2026.10.31.2"
 HOST = os.environ.get("WA_HOST")  # SSH host of the Mac; unset means read locally
 # Path of wa-launch on the Mac. wa-launch also sets it for the wa it runs, so hints name it.
 LAUNCHER = os.environ.get("WA_LAUNCHER")
+LAUNCHED = os.environ.get("WA_LAUNCHED") == "1"  # set by wa-launch, which holds the grant
 USAGE_LOG = os.path.expanduser("~/.wa/usage.jsonl")
 MEDIA_CACHE = "~/.cache/wa/media"  # expanded at use, so HOME can change in tests
 MEDIA_DIR = "Message"  # media paths in the database are relative to this folder
@@ -595,6 +596,14 @@ COMMANDS = {"chats": cmd_chats, "read": cmd_read, "search": cmd_search,
 def main(argv):
     a = build_parser().parse_args(argv)
     as_json, timeout = getattr(a, "json", False), getattr(a, "timeout", 30)
+    if LAUNCHED and (a.cmd == "usage" or (a.cmd == "media" and not a.b64)):
+        # The granted process must never write a file: a symlink could aim the write
+        # into a folder macOS protects. Media goes back as data and is saved by the caller.
+        print("wa: under wa-launch, wa only reads, so media comes back as data (--b64)",
+              file=sys.stderr)
+        print("Try: run wa media on the machine you read from; it saves the file there",
+              file=sys.stderr)
+        return 2
     if a.cmd == "usage":
         cmd_usage(as_json)
         return 0

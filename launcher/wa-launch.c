@@ -9,12 +9,16 @@
 //   wa-launch <wa arguments...>          for example: wa-launch chats --unread --json
 //
 // Walls:
-// - The wa script path is fixed at build time.
-// - The script and every folder above it must be owned by root, writable only by root,
-//   and not symlinks. Otherwise anyone running as you could swap the code it runs.
-// - Python gets a cleared environment and -I, so no variable steers it.
-// - -o is refused, so the granted process never writes files into protected folders.
-// Exit 3 for its own failures (wa's "cannot read" code), 2 for a refused argument.
+// - The Python binary, its standard library and the wa script are fixed at build time.
+//   install.sh picks the Command Line Tools Python, not the /usr/bin/python3 stub, which
+//   follows xcode-select and could land in a user-owned Xcode.
+// - Each of those, and every folder above it, must be owned by root, writable only by
+//   root, and not a symlink. Otherwise anyone running as you could swap the code it runs.
+// - Python runs with -I -S and a cleared environment, so no variable, user site or .pth
+//   file steers it.
+// - WA_LAUNCHED=1 tells wa to refuse every command that writes a file, so the granted
+//   process never writes into a folder macOS protects.
+// Exit 3 for its own failures, matching wa's "cannot read" code.
 //
 // responsibility_spawnattrs_setdisclaim is exported by libsystem but not documented.
 // If a macOS update breaks it, macOS denies access and wa exits 3. It fails closed.
@@ -37,8 +41,8 @@
 #ifndef WA_SCRIPT
 #define WA_SCRIPT "/usr/local/libexec/wa/wa"
 #endif
-#ifndef WA_PYTHON
-#define WA_PYTHON "/usr/bin/python3"
+#if !defined(WA_PYTHON) || !defined(WA_PYLIB)
+#error "build with launcher/install.sh, which sets WA_PYTHON and WA_PYLIB"
 #endif
 #define DISCLAIMED "--wa-launch-disclaimed"
 
@@ -85,13 +89,11 @@ static int root_owned_path(const char *path, char *bad, size_t badlen) {
 
 int main(int argc, char **argv) {
     char self[PATH_MAX], bad[PATH_MAX];
-    for (int i = 1; i < argc; i++)
-        if (strncmp(argv[i], "-o", 2) == 0)
-            return fail(2, "-o is refused here, so the granted process never writes files",
-                        "drop -o; wa saves media on the machine you run it from");
-    if (!root_owned_path(WA_SCRIPT, bad, sizeof bad))
-        return fail(3, "refusing to run, because this is missing or not owned and writable "
-                       "only by root", bad);
+    const char *fixed[] = {WA_PYTHON, WA_PYLIB, WA_PYLIB "/lib-dynload", WA_SCRIPT};
+    for (size_t i = 0; i < sizeof fixed / sizeof *fixed; i++)
+        if (!root_owned_path(fixed[i], bad, sizeof bad))
+            return fail(3, "refusing to run, because this is missing or not owned and "
+                           "writable only by root", bad);
     if (!own_path(self))
         return fail(3, "cannot find its own path", NULL);
 
@@ -121,14 +123,15 @@ int main(int argc, char **argv) {
     snprintf(user, sizeof user, "USER=%s", pw->pw_name);
     snprintf(launcher, sizeof launcher, "WA_LAUNCHER=%s", self);  // names the grant in hints
     char *env[] = {home, user, "PATH=/usr/bin:/bin:/usr/sbin:/sbin", "LANG=en_US.UTF-8",
-                   "WA_LOCAL=1", "WA_NOLOG=1", launcher, NULL};
+                   "WA_LOCAL=1", "WA_NOLOG=1", "WA_LAUNCHED=1", launcher, NULL};
 
-    char **args = calloc((size_t)argc + 2, sizeof *args);
+    char **args = calloc((size_t)argc + 3, sizeof *args);
     if (!args) return fail(3, "out of memory", NULL);
     args[0] = WA_PYTHON;
     args[1] = "-I";
-    args[2] = WA_SCRIPT;
-    for (int i = 2; i < argc; i++) args[i + 1] = argv[i];
+    args[2] = "-S";
+    args[3] = WA_SCRIPT;
+    for (int i = 2; i < argc; i++) args[i + 2] = argv[i];
 
     struct sigaction sa;
     memset(&sa, 0, sizeof sa);

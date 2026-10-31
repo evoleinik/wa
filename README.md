@@ -115,8 +115,9 @@ The launcher works because macOS checks Full Disk Access against the process res
 for a request, and over SSH that is sshd. `wa-launch` re-executes itself as its own
 responsible process before it starts `wa`. It uses an undocumented macOS call to do that.
 If an update breaks the call, `wa` exits 3 and reads nothing. `wa-launch` also refuses to
-run unless its copy of `wa`, and every folder above it, are owned and writable only by
-root. It clears the environment and refuses `-o`. Design notes:
+run unless its copy of `wa`, the Python it runs, and every folder above them are owned and
+writable only by root. It pins the Command Line Tools Python, clears the environment, and
+tells `wa` to refuse anything that writes a file. Design notes:
 [docs/plans/2026-10-31-ssh-without-full-disk-access.md](docs/plans/2026-10-31-ssh-without-full-disk-access.md).
 
 ## Commands

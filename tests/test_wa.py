@@ -3,6 +3,7 @@
 
 Run: python3 tests/test_wa.py   (stdlib only, Python 3.9+)
 """
+import base64
 import hashlib
 import importlib.machinery
 import importlib.util
@@ -455,6 +456,19 @@ class WaTest(unittest.TestCase):
         self.assertEqual(p.returncode, 3)
         self.assertIn("missing-launcher --version", p.stderr)
 
+    def test_launched_wa_refuses_every_file_write(self):
+        env = {"WA_LAUNCHED": "1", "HOME": os.path.join(self.tmp.name, "home4")}
+        out = os.path.join(self.tmp.name, "never.jpg")
+        for args in (["media", "3"], ["media", "3", "-o", out], ["usage"]):
+            p = self.run_wa(*args, env_extra=env)
+            self.assertEqual(p.returncode, 2, args)
+            self.assertIn("only reads", p.stderr)
+        self.assertFalse(os.path.exists(out))
+        self.assertFalse(os.path.exists(os.path.join(self.tmp.name, "home4")))
+        p = self.run_wa("media", "3", "--b64", "--json", env_extra=env)
+        self.assertEqual(p.returncode, 0, p.stderr)
+        self.assertEqual(base64.b64decode(json.loads(p.stdout)["data"]), JPEG)
+
     def test_access_denied_hint_names_the_launcher(self):
         locked = os.path.join(self.tmp.name, "locked")
         os.makedirs(locked, exist_ok=True)
@@ -482,44 +496,63 @@ class WaTest(unittest.TestCase):
 
 LAUNCHER_SRC = os.path.join(os.path.dirname(os.path.abspath(WA)), "..", "launcher",
                             "wa-launch.c")
+CLT_PYTHON = "/Library/Developer/CommandLineTools/usr/bin/python3"
 
 
-@unittest.skipUnless(sys.platform == "darwin" and shutil.which("cc"), "macOS with cc only")
+def clt_python_paths():
+    """The real Python binary and stdlib folder install.sh pins."""
+    out = subprocess.check_output([CLT_PYTHON, "-I", "-S", "-c", "import os, sys, sysconfig; "
+                                   "print(os.path.realpath(sys.executable)); "
+                                   "print(sysconfig.get_paths()['stdlib'])"], text=True)
+    return out.split()
+
+
+@unittest.skipUnless(sys.platform == "darwin" and shutil.which("cc")
+                     and os.path.exists(CLT_PYTHON), "macOS with Command Line Tools only")
 class LauncherTest(unittest.TestCase):
     """wa-launch, compiled for real. The green path needs passwordless sudo (CI has it)."""
 
     @classmethod
     def setUpClass(cls):
         cls.tmp = tempfile.TemporaryDirectory()
+        cls.python, cls.pylib = clt_python_paths()
 
     @classmethod
     def tearDownClass(cls):
         cls.tmp.cleanup()
 
-    def build(self, script):
-        out = os.path.join(self.tmp.name, "wa-launch-%d" % abs(hash(script)))
-        subprocess.run(["cc", "-O2", "-Wall", "-Wextra", "-Werror", '-DWA_SCRIPT="%s"' % script,
-                        "-o", out, LAUNCHER_SRC], check=True)
+    def build(self, script, python=None, pylib=None):
+        python, pylib = python or self.python, pylib or self.pylib
+        out = os.path.join(self.tmp.name, "wa-launch-%d" % abs(hash((script, python, pylib))))
+        subprocess.run(["cc", "-O2", "-Wall", "-Wextra", "-Werror",
+                        '-DWA_SCRIPT="%s"' % script, '-DWA_PYTHON="%s"' % python,
+                        '-DWA_PYLIB="%s"' % pylib, "-o", out, LAUNCHER_SRC], check=True)
         return out
 
     def run_launcher(self, exe, *args, env=None):
         return subprocess.run([exe] + list(args), capture_output=True, text=True, timeout=30,
                               env=env if env is not None else dict(os.environ))
 
+    def assert_refuses(self, exe, path):
+        p = self.run_launcher(exe, "--version")
+        self.assertEqual(p.returncode, 3, p.stdout + p.stderr)
+        self.assertIn("refusing to run", p.stderr)
+        self.assertIn(path, p.stderr)
+
     def test_refuses_a_script_you_could_edit(self):
         script = os.path.join(self.tmp.name, "wa")
         shutil.copy(WA, script)
-        p = self.run_launcher(self.build(script), "--version")
-        self.assertEqual(p.returncode, 3, p.stderr)
-        self.assertIn("refusing to run", p.stderr)
-        self.assertIn(self.tmp.name.split("/")[-1], p.stderr)
+        self.assert_refuses(self.build(script), os.path.realpath(self.tmp.name).split("/")[-1])
 
-    def test_refuses_output_paths(self):
-        exe = self.build("/usr/local/libexec/wa/wa")
-        for args in (["media", "3", "-o", "/tmp/x"], ["media", "3", "-o/tmp/x"]):
-            p = self.run_launcher(exe, *args)
-            self.assertEqual(p.returncode, 2, args)
-            self.assertIn("-o is refused", p.stderr)
+    def test_refuses_a_python_you_could_edit(self):
+        python = os.path.join(self.tmp.name, "python3")
+        shutil.copy(self.python, python)
+        self.assert_refuses(self.build("/usr/local/libexec/wa/wa", python=python), python)
+
+    def test_refuses_a_python_library_you_could_edit(self):
+        pylib = os.path.join(self.tmp.name, "lib")
+        os.makedirs(os.path.join(pylib, "lib-dynload"), exist_ok=True)
+        self.assert_refuses(self.build("/usr/local/libexec/wa/wa", pylib=pylib), pylib)
 
     def test_runs_root_owned_wa_with_a_cleared_environment(self):
         if subprocess.run(["sudo", "-n", "true"], capture_output=True).returncode != 0:
@@ -542,6 +575,11 @@ class LauncherTest(unittest.TestCase):
             p = self.run_launcher(exe, "status", "--json", env=env)
             self.assertNotEqual(p.returncode, 0, p.stdout)
             self.assertNotIn(fixture, p.stdout + p.stderr)
+            # The granted process never writes a file.
+            for args in (["media", "1"], ["usage"]):
+                p = self.run_launcher(exe, *args)
+                self.assertEqual(p.returncode, 2, args)
+                self.assertIn("only reads", p.stderr)
             # Root-owned is not enough: a folder your group can write is refused too.
             subprocess.run(["sudo", "chmod", "775", folder], check=True)
             p = self.run_launcher(exe, "--version")
@@ -549,7 +587,6 @@ class LauncherTest(unittest.TestCase):
             self.assertIn("refusing to run", p.stderr)
         finally:
             subprocess.run(["sudo", "rm", "-rf", folder], check=True)
-
 
 if __name__ == "__main__":
     unittest.main(verbosity=1)

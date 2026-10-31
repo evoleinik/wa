@@ -140,7 +140,16 @@ Two details changed while building:
 
 - `wa-launch` does not parse `wa` arguments. Its walls are a fixed root-owned script, a
   check that the script and every folder above it are owned by root and writable only by
-  root, a cleared environment, and a refusal of `-o`. `-o` would let the granted process
-  write into folders macOS protects.
+  root, and a cleared environment.
+- An automated security review of the first commit found two holes, both fixed with tests:
+  - Refusing `-o` was not enough. Plain `wa media` still saved into `~/.cache/wa/media`
+    under the grant, and a symlink there could aim that write into a protected folder.
+    Now `wa-launch` sets `WA_LAUNCHED=1`, and `wa` refuses `usage` and any `media` call
+    without `--b64`. The launched process writes no file at all.
+  - `/usr/bin/python3` follows `xcode-select`, which can point into an Xcode the user
+    owns. Its Python files would then be editable, and they run under the grant.
+    `install.sh` now pins the Command Line Tools Python, checks every file in its standard
+    library is root-owned, and builds both paths in. `wa-launch` checks them on every run
+    and starts Python with `-I -S`, so no `.pth` file loads.
 - It re-executes itself with responsibility disclaimed (`POSIX_SPAWN_SETEXEC`, as
   `dotnet/macios` does), so it stays one process before it starts Python.
