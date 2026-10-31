@@ -1,0 +1,520 @@
+#!/usr/bin/env python3
+"""wa - read-only WhatsApp CLI over the WhatsApp for Mac database.
+
+On the Mac it reads the database in place. From another machine, set WA_HOST to
+the Mac's SSH host: wa sends itself over SSH and the query runs there, so the
+database stays on the Mac and only printed rows cross SSH. It never writes the
+database: it opens it with mode=ro and PRAGMA query_only.
+
+Exit codes: 0 ok (empty results print a hint to stderr), 1 WhatsApp changed its
+database schema, 2 bad arguments or no single chat matched, 3 cannot reach the
+host or read the database, 4 a bug in wa.
+
+Python 3.9 compatible, because macOS ships /usr/bin/python3 3.9.
+https://github.com/evoleinik/wa
+"""
+import argparse
+import json
+import os
+import re
+import shlex
+import sqlite3
+import subprocess
+import sys
+import time
+import urllib.parse
+from datetime import datetime
+
+DEFAULT_DB = os.path.expanduser(
+    "~/Library/Group Containers/group.net.whatsapp.WhatsApp.shared/ChatStorage.sqlite")
+VERSION = "2026.10.31"
+HOST = os.environ.get("WA_HOST")  # SSH host of the Mac; unset means read locally
+USAGE_LOG = os.path.expanduser("~/.wa/usage.jsonl")
+EPOCH = 978307200  # Core Data dates count seconds from 2001-01-01 UTC.
+FDA_FIX = ("on the Mac, System Settings > Privacy & Security > Full Disk Access: add your "
+           "terminal app, or /usr/libexec/sshd-keygen-wrapper when reading over SSH")
+ISSUES = "https://github.com/evoleinik/wa/issues"
+
+# Every column the queries read. A WhatsApp update that drops one reds every command.
+REQUIRED = {
+    "ZWAMESSAGE": ["Z_PK", "ZCHATSESSION", "ZGROUPMEMBER", "ZMEDIAITEM", "ZISFROMME",
+                   "ZMESSAGETYPE", "ZMESSAGEDATE", "ZTEXT"],
+    "ZWACHATSESSION": ["Z_PK", "ZCONTACTJID", "ZPARTNERNAME", "ZSESSIONTYPE",
+                       "ZLASTMESSAGEDATE", "ZLASTMESSAGE", "ZUNREADCOUNT",
+                       "ZARCHIVED", "ZHIDDEN", "ZREMOVED"],
+    "ZWAGROUPMEMBER": ["Z_PK", "ZMEMBERJID", "ZCONTACTNAME", "ZFIRSTNAME"],
+    "ZWAPROFILEPUSHNAME": ["ZJID", "ZPUSHNAME"],
+    "ZWAMEDIAITEM": ["Z_PK", "ZTITLE"],
+}
+# Session types: 0 direct, 1 group, 4 community group. 2 broadcast and 3 status are skipped.
+CHAT_FILTER = ("s.ZSESSIONTYPE IN (0,1,4) AND coalesce(s.ZHIDDEN,0)=0 "
+               "AND coalesce(s.ZREMOVED,0)=0")
+LABELS = {1: "image", 2: "video", 3: "voice", 4: "contact", 5: "location", 8: "document",
+          11: "gif", 14: "deleted", 15: "sticker", 23: "video", 27: "invite", 46: "poll"}
+SYSTEM = (6, 10, 13)
+PLAIN = (0, 7)  # text and link messages
+VISIBLE = ("(m.ZMESSAGETYPE IN (%s) OR (m.ZMESSAGETYPE NOT IN (%s) AND m.ZTEXT IS NOT NULL))"
+           % (",".join(str(t) for t in PLAIN + tuple(LABELS)), ",".join(str(t) for t in SYSTEM)))
+
+MSG_SQL = """
+SELECT m.ZMESSAGEDATE, m.ZISFROMME, m.ZMESSAGETYPE, m.ZTEXT, mi.ZTITLE,
+       s.ZPARTNERNAME, s.ZCONTACTJID, s.ZSESSIONTYPE,
+       gm.ZCONTACTNAME, gm.ZFIRSTNAME,
+       (SELECT p.ZPUSHNAME FROM ZWAPROFILEPUSHNAME p WHERE p.ZJID = gm.ZMEMBERJID LIMIT 1),
+       gm.ZMEMBERJID
+FROM ZWAMESSAGE m
+JOIN ZWACHATSESSION s ON s.Z_PK = m.ZCHATSESSION
+LEFT JOIN ZWAMEDIAITEM mi ON mi.Z_PK = m.ZMEDIAITEM
+LEFT JOIN ZWAGROUPMEMBER gm ON gm.Z_PK = m.ZGROUPMEMBER
+WHERE {where}
+ORDER BY m.ZMESSAGEDATE DESC
+LIMIT ?
+"""
+
+
+class Fail(Exception):
+    def __init__(self, code, msg, hint=None):
+        Exception.__init__(self, msg)
+        self.code, self.msg, self.hint = code, msg, hint
+
+
+def since_arg(s):
+    if re.fullmatch(r"\d+[mhdw]", s):
+        return s
+    try:
+        datetime.strptime(s, "%Y-%m-%d")
+        return s
+    except ValueError:
+        raise argparse.ArgumentTypeError("use 30m, 24h, 7d, 2w or a real date like 2026-10-01")
+
+
+def positive_int(s):
+    if s.isdigit() and int(s) > 0:
+        return int(s)
+    raise argparse.ArgumentTypeError("must be a whole number above 0")
+
+
+CONTROL = re.compile("[\x00-\x08\x0b-\x1f\x7f-\x9f]")
+
+
+def clean(text):
+    """Drop control characters, so a message cannot send escape codes to the terminal."""
+    return CONTROL.sub("", text or "")
+
+
+def since_value(s):
+    if re.fullmatch(r"\d{4}-\d{2}-\d{2}", s):
+        return datetime.strptime(s, "%Y-%m-%d").timestamp() - EPOCH
+    unit = {"m": 60, "h": 3600, "d": 86400, "w": 604800}[s[-1]]
+    return time.time() - int(s[:-1]) * unit - EPOCH
+
+
+def short_time(ts):
+    if ts is None:
+        return "----------------"
+    return datetime.fromtimestamp(ts + EPOCH).strftime("%Y-%m-%d %H:%M")
+
+
+def iso_time(ts):
+    if ts is None:
+        return None
+    return datetime.fromtimestamp(ts + EPOCH).astimezone().isoformat(timespec="seconds")
+
+
+def user_part(jid):
+    return jid.split("@")[0] if jid else None
+
+
+def one_line(text, limit=None):
+    text = clean((text or "").replace("\r", "").replace("\n", " ⏎ ")).strip()
+    if limit and len(text) > limit:
+        return text[:limit] + "…"
+    return text
+
+
+def connect(path):
+    """Open read-only. Raises Fail(3) when the file cannot be read, Fail(1) on schema drift."""
+    folder = os.path.dirname(path)
+    try:
+        os.listdir(folder)
+    except PermissionError:
+        raise Fail(3, "macOS denied access to %s" % folder, FDA_FIX)
+    except FileNotFoundError:
+        raise Fail(3, "no WhatsApp data at %s" % folder, "install and sign in to WhatsApp for Mac")
+    if not os.path.exists(path):
+        raise Fail(3, "database missing: %s" % path, "open WhatsApp for Mac once, then retry")
+    # WhatsApp keeps the DB in WAL mode. While it runs, the -shm index exists and a normal
+    # read-only open shares it. After it quits, -shm is gone: a read-only open then fails
+    # (macOS SQLite) or creates -shm in WhatsApp's folder (newer SQLite). immutable=1 reads
+    # the main file with no index, no locks and no new files.
+    uri = "file:%s?mode=ro" % urllib.parse.quote(path)
+    if not os.path.exists(path + "-shm"):
+        uri += "&immutable=1"
+        wal = path + "-wal"
+        if os.path.exists(wal) and os.path.getsize(wal) > 0:
+            print("wa: WhatsApp is not running and left unsaved changes; "
+                  "the newest messages may be missing. Open WhatsApp to fix.", file=sys.stderr)
+    try:
+        db = sqlite3.connect(uri, uri=True, timeout=5)
+        db.execute("PRAGMA query_only=1")
+        # One message with broken UTF-8 must not stop a whole listing.
+        db.text_factory = lambda b: b.decode("utf-8", "replace")
+        missing = []
+        for table, cols in REQUIRED.items():
+            have = {r[1] for r in db.execute("PRAGMA table_info(%s)" % table)}
+            missing += ["%s.%s" % (table, c) for c in cols if c not in have]
+    except sqlite3.Error as e:
+        raise Fail(3, "cannot read %s: %s" % (path, e), "wa status, then open WhatsApp for Mac")
+    if missing:
+        raise Fail(1, "WhatsApp changed its database schema. Missing: %s" % ", ".join(missing),
+                   "upgrade wa, or report it at " + ISSUES)
+    db.create_function("wa_match", 2, match_terms, deterministic=True)
+    return db
+
+
+def match_terms(text, query):
+    """Every whitespace-separated term must appear, case-insensitive, any script."""
+    hay = (text or "").casefold()
+    return all(t in hay for t in query.casefold().split())
+
+
+def to_message(row):
+    date, me, typ, text, title, chat, jid, stype, gname, gfirst, push, mjid = row
+    if me:
+        sender = "me"
+    elif stype == 0:
+        sender = chat or user_part(jid)
+    else:
+        sender = gname or gfirst or push or user_part(mjid) or "?"
+    body = "" if typ == 14 else (text or title or "").strip()
+    if typ in PLAIN:
+        kind = "text"
+    elif typ in SYSTEM:
+        kind = "system"
+    else:
+        kind = LABELS.get(typ, "type %d" % typ)
+    return {"time": iso_time(date), "ts": date, "chat": chat or user_part(jid),
+            "from": sender, "me": bool(me), "type": kind, "text": body}
+
+
+def shown(msg):
+    return msg["text"] if msg["type"] == "text" else ("[%s] %s" % (msg["type"], msg["text"])).strip()
+
+
+def query_messages(db, where, params, limit, show_all):
+    clauses = [CHAT_FILTER] + where + ([] if show_all else [VISIBLE])
+    sql = MSG_SQL.format(where=" AND ".join(clauses))
+    return [to_message(r) for r in db.execute(sql, params + [limit])]
+
+
+def resolve_chat(db, q):
+    rows = db.execute("SELECT s.Z_PK, s.ZPARTNERNAME, s.ZCONTACTJID FROM ZWACHATSESSION s WHERE "
+                      + CHAT_FILTER + " ORDER BY s.ZLASTMESSAGEDATE DESC").fetchall()
+    hits = [r for r in rows if r[2] == q]  # an exact JID wins
+    if not hits:
+        folded = q.casefold()
+        # Phone digits match a person's number, never a group id or digits in a name.
+        digits = re.sub(r"\D", "", q) if re.fullmatch(r"[\d\s()+.-]+", q) else ""
+        hits = [r for r in rows if folded in (r[1] or "").casefold()
+                or (len(digits) >= 5 and not (r[2] or "").endswith("@g.us")
+                    and digits in (user_part(r[2]) or ""))]
+        exact = [r for r in hits if (r[1] or "").casefold() == folded]
+        if len(exact) == 1:
+            hits = exact
+    if not hits:
+        raise Fail(2, "no chat matches %r (searched %d chats)" % (q, len(rows)),
+                   "wa chats -n 100")
+    if len(hits) > 1:
+        lines = "\n".join("  %s    # %s" % (shlex.join(["wa", "read", r[2]]), clean(r[1]))
+                          for r in hits[:10])
+        more = "" if len(hits) <= 10 else "\n  ... and %d more" % (len(hits) - 10)
+        raise Fail(2, "%d chats match %r. Re-run with one JID:\n%s%s" % (len(hits), q, lines, more))
+    return hits[0]
+
+
+def cmd_chats(db, a):
+    # ZLASTMESSAGETEXT holds encoded bytes, so the preview comes from the last message row.
+    # Pinned chats carry a ZLASTMESSAGEDATE ~7000 years ahead, so order and show by the
+    # real last message time and flag the pin.
+    sql = ("SELECT s.ZPARTNERNAME, s.ZCONTACTJID, s.ZSESSIONTYPE, "
+           "coalesce(lm.ZMESSAGEDATE, CASE WHEN s.ZLASTMESSAGEDATE > ? THEN NULL "
+           "ELSE s.ZLASTMESSAGEDATE END) AS last, s.ZUNREADCOUNT, "
+           "lm.ZMESSAGETYPE, coalesce(lm.ZTEXT, lmi.ZTITLE), s.ZARCHIVED, "
+           "s.ZLASTMESSAGEDATE > ? AS pinned FROM ZWACHATSESSION s "
+           "LEFT JOIN ZWAMESSAGE lm ON lm.Z_PK = s.ZLASTMESSAGE "
+           "LEFT JOIN ZWAMEDIAITEM lmi ON lmi.Z_PK = lm.ZMEDIAITEM WHERE "
+           + CHAT_FILTER + " AND s.ZLASTMESSAGEDATE IS NOT NULL"
+           + (" AND coalesce(s.ZUNREADCOUNT,0) != 0" if a.unread else "")
+           + " ORDER BY last DESC LIMIT ?")
+    out = []
+    a_year_ahead = time.time() - EPOCH + 365 * 86400
+    for name, jid, stype, last, unread, ltype, ltext, archived, pinned in db.execute(
+            sql, [a_year_ahead, a_year_ahead, a.n]):
+        if ltype is None or ltype in PLAIN:
+            preview = ltext
+        elif ltype in SYSTEM:
+            preview = "[system]"  # its text is a JSON event payload
+        else:
+            preview = ("[%s] %s" % (LABELS.get(ltype, "type %d" % ltype),
+                                    "" if ltype == 14 else (ltext or ""))).strip()
+        out.append({"name": name or user_part(jid), "jid": jid,
+                    "kind": "dm" if stype == 0 else "group", "last": iso_time(last),
+                    "unread": unread or 0, "archived": bool(archived), "pinned": bool(pinned),
+                    "preview": one_line(preview, 80), "ts": last})
+    if not out:
+        hint("No%s chats found." % (" unread" if a.unread else ""),
+             "wa chats" if a.unread else "open WhatsApp for Mac so it syncs")
+    return out, lambda c: "%s  %s%s: %s" % (
+        short_time(c["ts"]), clean(c["name"]),
+        "".join(" [%s]" % t for t in (
+            "group" if c["kind"] == "group" else "",
+            "%s unread" % c["unread"] if c["unread"] else "",
+            "pinned" if c["pinned"] else "",
+            "archived" if c["archived"] else "") if t),
+        c["preview"])
+
+
+def cmd_read(db, a):
+    pk, name, jid = resolve_chat(db, a.chat)
+    where, params = ["s.Z_PK = ?"], [pk]
+    if a.since:
+        where.append("m.ZMESSAGEDATE >= ?")
+        params.append(since_value(a.since))
+    msgs = query_messages(db, where, params, a.n, a.all)[::-1]
+    if not msgs:
+        hint("No messages in %s (%s)%s." % (clean(name), jid, " since " + a.since if a.since else ""),
+             "drop --since, or add --all for system events")
+    return msgs, lambda m: "%s %s: %s" % (short_time(m["ts"]), clean(m["from"]),
+                                          one_line(shown(m)))
+
+
+def cmd_search(db, a):
+    query = " ".join(a.query)
+    where, params, scope = ["wa_match(coalesce(m.ZTEXT,'') || ' ' || coalesce(mi.ZTITLE,''), ?)"], [query], []
+    if a.chat:
+        pk, name, _ = resolve_chat(db, a.chat)
+        where.append("s.Z_PK = ?")
+        params.append(pk)
+        scope.append("chat " + name)
+    if a.since:
+        where.append("m.ZMESSAGEDATE >= ?")
+        params.append(since_value(a.since))
+        scope.append("since " + a.since)
+    msgs = query_messages(db, where, params, a.n, a.all)
+    if not msgs:
+        tries = (["drop --chat"] if a.chat else []) + (["drop --since"] if a.since else []) \
+            + (["fewer words"] if len(query.split()) > 1 else []) + ["a shorter word stem"]
+        hint("Searched all messages (%s) for every word of %r." % (", ".join(scope) or "all chats, all time", query),
+             ", ".join(tries))
+    return msgs, lambda m: "%s [%s] %s: %s" % (short_time(m["ts"]), clean(m["chat"]),
+                                              clean(m["from"]), one_line(shown(m), 200))
+
+
+def cmd_recent(db, a):
+    where, params = ["m.ZMESSAGEDATE >= ?"], [since_value(a.since)]
+    if a.chat:
+        pk, _, _ = resolve_chat(db, a.chat)
+        where.append("s.Z_PK = ?")
+        params.append(pk)
+    msgs = query_messages(db, where, params, a.n, a.all)[::-1]
+    if not msgs:
+        hint("No messages in the last %s%s." % (a.since, " in that chat" if a.chat else ""),
+             "--since 7d")
+    return msgs, lambda m: "%s [%s] %s: %s" % (short_time(m["ts"]), clean(m["chat"]),
+                                              clean(m["from"]), one_line(shown(m), 200))
+
+
+def cmd_status(db, a):
+    msgs, chats, last = db.execute(
+        "SELECT (SELECT count(*) FROM ZWAMESSAGE), (SELECT count(*) FROM ZWACHATSESSION s WHERE "
+        + CHAT_FILTER + "), (SELECT max(ZMESSAGEDATE) FROM ZWAMESSAGE)").fetchone()
+    path = os.environ.get("WA_DB", DEFAULT_DB)
+    out = {"db": path, "size_mb": round(os.path.getsize(path) / 1e6, 1), "messages": msgs,
+           "chats": chats, "latest": iso_time(last) if last else None, "schema_ok": True}
+    return out, lambda o: "ok: %s messages, %s chats, latest %s, %s MB" % (
+        o["messages"], o["chats"], o["latest"], o["size_mb"])
+
+
+def hint(what, tries):
+    print("%s Try: %s" % (what, tries), file=sys.stderr)
+
+
+def emit(result, fmt, as_json):
+    items = result if isinstance(result, list) else [result]
+    if as_json:
+        for item in items:
+            item.pop("ts", None)  # internal sort key; JSON carries "time"/"last"
+        print(json.dumps(result, ensure_ascii=False))
+    else:
+        for item in items:
+            print(fmt(item))
+
+
+CONTROL_PATH = os.path.expanduser("~/.ssh/wa-%C")
+
+
+def remote_command(argv, host, timeout=30):
+    """The ssh argv that runs this same script on host with the given arguments."""
+    # One shared SSH connection, kept 10 minutes, turns a ~2 s call into a ~0.5 s one.
+    # Keepalives drop it within ~10 s once the Mac sleeps, instead of hanging every call.
+    return ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=%d" % min(timeout, 15),
+            "-o", "ServerAliveInterval=5", "-o", "ServerAliveCountMax=2",
+            "-o", "ControlMaster=auto", "-o", "ControlPersist=10m",
+            "-o", "ControlPath=" + CONTROL_PATH, "--", host,
+            "/usr/bin/env WA_LOCAL=1 WA_NOLOG=1 /usr/bin/python3 - " + shlex.join(argv)]
+
+
+def run_remote(argv, host, timeout):
+    with open(os.path.realpath(__file__), "rb") as f:
+        src = f.read()
+    try:
+        p = subprocess.run(remote_command(argv, host, timeout), input=src, timeout=timeout)
+    except subprocess.TimeoutExpired:
+        # A shared connection left from before the Mac slept can hang; close it so the
+        # next call connects fresh.
+        subprocess.run(["ssh", "-O", "exit", "-o", "ControlPath=" + CONTROL_PATH, "--", host],
+                       capture_output=True, timeout=5)
+        raise Fail(3, "no answer from %s after %ds" % (host, timeout),
+                   "check the Mac is awake: ssh %s true" % shlex.quote(host))
+    if p.returncode == 255:
+        raise Fail(3, "cannot reach %s over SSH" % host,
+                   "check the Mac is awake: ssh %s true" % shlex.quote(host))
+    if p.returncode not in (0, 1, 2, 3, 4):
+        raise Fail(3, "the command failed on %s (exit %d)" % (host, p.returncode),
+                   "check python works there: ssh %s /usr/bin/python3 --version"
+                   % shlex.quote(host))
+    return p.returncode
+
+
+def build_parser():
+    common = argparse.ArgumentParser(add_help=False)
+    common.add_argument("--json", action="store_true", default=argparse.SUPPRESS,
+                        help="JSON output: bare array, or one object for status")
+    common.add_argument("--timeout", type=int, default=argparse.SUPPRESS,
+                        help="seconds to wait for WA_HOST over SSH (default 30)")
+    msg = argparse.ArgumentParser(add_help=False)
+    msg.add_argument("--all", action="store_true",
+                     help="include group events and unlabeled message types")
+    p = argparse.ArgumentParser(
+        prog="wa", parents=[common], formatter_class=argparse.RawDescriptionHelpFormatter,
+        description="Read-only WhatsApp CLI over the WhatsApp for Mac database. Runs on the "
+                    "Mac, or over SSH when WA_HOST is set. Times are the Mac's local time.",
+        epilog="examples:\n  wa chats --unread\n  wa read 'Alice' -n 50\n"
+               "  wa search invoice --since 30d\n  wa recent --since 6h --json\n  wa status\n"
+               "  WA_HOST=my-mac wa chats\n\n"
+               "Status updates, broadcasts and hidden chats are skipped.\n" + ISSUES)
+    p.add_argument("--version", action="version", version="wa " + VERSION)
+    sub = p.add_subparsers(dest="cmd", metavar="command", required=True)
+    c = sub.add_parser("chats", parents=[common], help="recent chats, newest first")
+    c.add_argument("-n", type=positive_int, default=20, help="max chats (default 20)")
+    c.add_argument("--unread", action="store_true", help="only chats with unread messages")
+    r = sub.add_parser("read", parents=[common, msg], help="messages in one chat, oldest first")
+    r.add_argument("chat", help="name substring, phone digits, or exact JID")
+    r.add_argument("-n", type=positive_int, default=30, help="last N messages (default 30)")
+    r.add_argument("--since", type=since_arg, help="30m, 24h, 7d, 2w or YYYY-MM-DD")
+    s = sub.add_parser("search", parents=[common, msg], help="messages containing every word")
+    s.add_argument("query", nargs="+", help="words that must all appear, any case")
+    s.add_argument("--chat", help="limit to one chat")
+    s.add_argument("--since", type=since_arg, help="30m, 24h, 7d, 2w or YYYY-MM-DD")
+    s.add_argument("-n", type=positive_int, default=20, help="max results, newest first (default 20)")
+    t = sub.add_parser("recent", parents=[common, msg], help="all chats since a time, oldest first")
+    t.add_argument("--since", type=since_arg, default="24h", help="default 24h")
+    t.add_argument("--chat", help="limit to one chat")
+    t.add_argument("-n", type=positive_int, default=50, help="max messages (default 50)")
+    sub.add_parser("status", parents=[common], help="check access and schema, print counts")
+    sub.add_parser("usage", parents=[common], help="30-day stats from this machine's usage log")
+    return p
+
+
+def log_usage(cmd, code, ms, remote):
+    if os.environ.get("WA_NOLOG"):
+        return
+    try:
+        os.makedirs(os.path.dirname(USAGE_LOG), exist_ok=True)
+        with open(USAGE_LOG, "a") as f:
+            f.write(json.dumps({"ts": datetime.now().astimezone().isoformat(timespec="seconds"),
+                                "cmd": cmd, "ok": code == 0, "exit": code, "ms": ms,
+                                "remote": remote}) + "\n")
+    except Exception:
+        pass
+
+
+def cmd_usage(as_json):
+    cutoff = time.time() - 30 * 86400
+    rows = []
+    try:
+        with open(USAGE_LOG) as f:
+            for line in f:
+                try:
+                    e = json.loads(line)
+                    if datetime.fromisoformat(e["ts"]).timestamp() >= cutoff:
+                        rows.append(e)
+                except (ValueError, KeyError):
+                    continue
+    except FileNotFoundError:
+        pass
+    by_cmd = {}
+    for e in rows:
+        by_cmd.setdefault(e["cmd"], []).append(e)
+    out = {cmd: {"calls": len(es), "ok": sum(e["ok"] for e in es),
+                 "avg_ms": int(sum(e["ms"] for e in es) / len(es)),
+                 "exits": sorted({e["exit"] for e in es})} for cmd, es in by_cmd.items()}
+    if not rows:
+        hint("No calls logged in 30 days at %s." % USAGE_LOG, "wa status")
+    print(json.dumps(out, ensure_ascii=False) if as_json else "\n".join(
+        "%s: %d calls, %d ok, avg %d ms, exits %s" % (k, v["calls"], v["ok"], v["avg_ms"], v["exits"])
+        for k, v in sorted(out.items())))
+
+
+COMMANDS = {"chats": cmd_chats, "read": cmd_read, "search": cmd_search,
+            "recent": cmd_recent, "status": cmd_status}
+
+
+def main(argv):
+    a = build_parser().parse_args(argv)
+    as_json, timeout = getattr(a, "json", False), getattr(a, "timeout", 30)
+    if a.cmd == "usage":
+        cmd_usage(as_json)
+        return 0
+    path = os.environ.get("WA_DB", DEFAULT_DB)
+    # On a Mac without WA_HOST, read locally even when macOS hides the file, so the
+    # Full Disk Access error names the fix. Off a Mac, WA_HOST is the only way in.
+    local = (os.environ.get("WA_LOCAL") == "1" or "WA_DB" in os.environ
+             or os.path.exists(path) or (not HOST and sys.platform == "darwin"))
+    start = time.time()
+    try:
+        if local:
+            db = connect(path)
+            try:
+                result, fmt = COMMANDS[a.cmd](db, a)
+            except sqlite3.Error as e:
+                raise Fail(3, "query failed: %s" % e, "wa status, then report it at " + ISSUES)
+            emit(result, fmt, as_json)
+            code = 0
+        elif HOST:
+            code = run_remote(argv, HOST, timeout)
+        else:
+            raise Fail(3, "no WhatsApp for Mac database on this machine",
+                       "run wa on the Mac, or set WA_HOST to the Mac's SSH host")
+    except Fail as f:
+        print("wa: " + f.msg, file=sys.stderr)
+        if f.hint:
+            print("Try: " + f.hint, file=sys.stderr)
+        code = f.code
+    except BrokenPipeError:
+        raise
+    except Exception as e:  # a bug in wa, never the schema-drift exit code
+        print("wa: unexpected %s: %s" % (type(e).__name__, e), file=sys.stderr)
+        print("Try: report it at " + ISSUES, file=sys.stderr)
+        code = 4
+    log_usage(a.cmd, code, int((time.time() - start) * 1000), not local)
+    return code
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main(sys.argv[1:]))
+    except BrokenPipeError:
+        # The reader closed early (| head). Silence the flush at exit too.
+        os.dup2(os.open(os.devnull, os.O_WRONLY), sys.stdout.fileno())
+        sys.exit(0)

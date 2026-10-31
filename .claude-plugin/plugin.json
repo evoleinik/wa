@@ -1,0 +1,13 @@
+{
+  "name": "wa",
+  "version": "2026.10.31",
+  "description": "Read-only WhatsApp for Claude: the wa CLI and a skill over the WhatsApp for Mac database. No linked device, no QR code.",
+  "author": {
+    "name": "Evgeny Oleynik",
+    "url": "https://github.com/evoleinik"
+  },
+  "homepage": "https://github.com/evoleinik/wa",
+  "repository": "https://github.com/evoleinik/wa",
+  "license": "MIT",
+  "keywords": ["whatsapp", "macos", "read-only", "cli", "messages"]
+}
