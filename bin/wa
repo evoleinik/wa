@@ -6,6 +6,9 @@ the Mac's SSH host: wa sends itself over SSH and the query runs there, so the
 database stays on the Mac and only printed rows cross SSH. It never writes the
 database: it opens it with mode=ro and PRAGMA query_only.
 
+`wa media <id>` is the one command that writes, and only a copy of one media file,
+into ~/.cache/wa/media or the -o path, on the machine running wa.
+
 Exit codes: 0 ok (empty results print a hint to stderr), 1 WhatsApp changed its
 database schema, 2 bad arguments or no single chat matched, 3 cannot reach the
 host or read the database, 4 a bug in wa.
@@ -14,10 +17,12 @@ Python 3.9 compatible, because macOS ships /usr/bin/python3 3.9.
 https://github.com/evoleinik/wa
 """
 import argparse
+import base64
 import json
 import os
 import re
 import shlex
+import shutil
 import sqlite3
 import subprocess
 import sys
@@ -27,9 +32,11 @@ from datetime import datetime
 
 DEFAULT_DB = os.path.expanduser(
     "~/Library/Group Containers/group.net.whatsapp.WhatsApp.shared/ChatStorage.sqlite")
-VERSION = "2026.10.31"
+VERSION = "2026.10.31.1"
 HOST = os.environ.get("WA_HOST")  # SSH host of the Mac; unset means read locally
 USAGE_LOG = os.path.expanduser("~/.wa/usage.jsonl")
+MEDIA_CACHE = "~/.cache/wa/media"  # expanded at use, so HOME can change in tests
+MEDIA_DIR = "Message"  # media paths in the database are relative to this folder
 EPOCH = 978307200  # Core Data dates count seconds from 2001-01-01 UTC.
 FDA_FIX = ("on the Mac, System Settings > Privacy & Security > Full Disk Access: add your "
            "terminal app, or /usr/libexec/sshd-keygen-wrapper when reading over SSH")
@@ -44,7 +51,7 @@ REQUIRED = {
                        "ZARCHIVED", "ZHIDDEN", "ZREMOVED"],
     "ZWAGROUPMEMBER": ["Z_PK", "ZMEMBERJID", "ZCONTACTNAME", "ZFIRSTNAME"],
     "ZWAPROFILEPUSHNAME": ["ZJID", "ZPUSHNAME"],
-    "ZWAMEDIAITEM": ["Z_PK", "ZTITLE"],
+    "ZWAMEDIAITEM": ["Z_PK", "ZTITLE", "ZMEDIALOCALPATH", "ZXMPPTHUMBPATH"],
 }
 # Session types: 0 direct, 1 group, 4 community group. 2 broadcast and 3 status are skipped.
 CHAT_FILTER = ("s.ZSESSIONTYPE IN (0,1,4) AND coalesce(s.ZHIDDEN,0)=0 "
@@ -61,7 +68,7 @@ SELECT m.ZMESSAGEDATE, m.ZISFROMME, m.ZMESSAGETYPE, m.ZTEXT, mi.ZTITLE,
        s.ZPARTNERNAME, s.ZCONTACTJID, s.ZSESSIONTYPE,
        gm.ZCONTACTNAME, gm.ZFIRSTNAME,
        (SELECT p.ZPUSHNAME FROM ZWAPROFILEPUSHNAME p WHERE p.ZJID = gm.ZMEMBERJID LIMIT 1),
-       gm.ZMEMBERJID
+       gm.ZMEMBERJID, m.Z_PK, mi.ZMEDIALOCALPATH, mi.ZXMPPTHUMBPATH
 FROM ZWAMESSAGE m
 JOIN ZWACHATSESSION s ON s.Z_PK = m.ZCHATSESSION
 LEFT JOIN ZWAMEDIAITEM mi ON mi.Z_PK = m.ZMEDIAITEM
@@ -70,6 +77,9 @@ WHERE {where}
 ORDER BY m.ZMESSAGEDATE DESC
 LIMIT ?
 """
+
+
+MEDIA_BASE = None  # set by connect(): the folder media paths are relative to
 
 
 class Fail(Exception):
@@ -169,7 +179,26 @@ def connect(path):
         raise Fail(1, "WhatsApp changed its database schema. Missing: %s" % ", ".join(missing),
                    "upgrade wa, or report it at " + ISSUES)
     db.create_function("wa_match", 2, match_terms, deterministic=True)
+    global MEDIA_BASE
+    MEDIA_BASE = os.path.join(os.path.dirname(path), MEDIA_DIR)
     return db
+
+
+def media_file(rel):
+    """Absolute path of a media file inside MEDIA_BASE, or None when absent or outside it."""
+    if not rel:
+        return None
+    base = os.path.realpath(MEDIA_BASE)
+    full = os.path.realpath(os.path.join(base, rel))
+    if not full.startswith(base + os.sep) or not os.path.isfile(full):
+        return None
+    return full
+
+
+def media_state(full_rel, thumb_rel):
+    if media_file(full_rel):
+        return "full"
+    return "preview" if media_file(thumb_rel) else "missing"
 
 
 def match_terms(text, query):
@@ -179,7 +208,8 @@ def match_terms(text, query):
 
 
 def to_message(row):
-    date, me, typ, text, title, chat, jid, stype, gname, gfirst, push, mjid = row
+    date, me, typ, text, title, chat, jid, stype, gname, gfirst, push, mjid = row[:12]
+    pk, full_rel, thumb_rel = row[12:]
     if me:
         sender = "me"
     elif stype == 0:
@@ -193,12 +223,18 @@ def to_message(row):
         kind = "system"
     else:
         kind = LABELS.get(typ, "type %d" % typ)
-    return {"time": iso_time(date), "ts": date, "chat": chat or user_part(jid),
-            "from": sender, "me": bool(me), "type": kind, "text": body}
+    media = None
+    if kind not in ("text", "system", "deleted") and (full_rel or thumb_rel):
+        media = media_state(full_rel, thumb_rel)
+    return {"id": pk, "time": iso_time(date), "ts": date, "chat": chat or user_part(jid),
+            "from": sender, "me": bool(me), "type": kind, "text": body, "media": media}
 
 
 def shown(msg):
-    return msg["text"] if msg["type"] == "text" else ("[%s] %s" % (msg["type"], msg["text"])).strip()
+    if msg["type"] == "text":
+        return msg["text"]
+    tag = msg["type"] + (" #%d" % msg["id"] if msg.get("media") else "")
+    return ("[%s] %s" % (tag, msg["text"])).strip()
 
 
 def query_messages(db, where, params, limit, show_all):
@@ -324,6 +360,56 @@ def cmd_recent(db, a):
                                               clean(m["from"]), one_line(shown(m), 200))
 
 
+def media_row(db, mid):
+    row = db.execute(
+        "SELECT m.ZMESSAGETYPE, mi.ZMEDIALOCALPATH, mi.ZXMPPTHUMBPATH, m.ZMESSAGEDATE, "
+        "s.ZPARTNERNAME, s.ZCONTACTJID FROM ZWAMESSAGE m "
+        "JOIN ZWACHATSESSION s ON s.Z_PK = m.ZCHATSESSION "
+        "LEFT JOIN ZWAMEDIAITEM mi ON mi.Z_PK = m.ZMEDIAITEM "
+        "WHERE m.Z_PK = ? AND " + CHAT_FILTER, [mid]).fetchone()
+    if not row:
+        raise Fail(2, "no message with id %d" % mid, "take ids from wa read --json")
+    typ, full_rel, thumb_rel, date, chat, jid = row
+    if not (full_rel or thumb_rel):
+        raise Fail(2, "message %d has no media" % mid, "take ids from [image #id] lines")
+    src = media_file(full_rel)
+    kind = "full"
+    if not src:
+        src, kind = media_file(thumb_rel), "preview"
+    if not src:
+        raise Fail(3, "the file for message %d is not on the Mac" % mid,
+                   "open that chat in WhatsApp for Mac to download it, then rerun")
+    ext = os.path.splitext(full_rel or "")[1] if kind == "full" else ".jpg"
+    name = "%d%s%s" % (mid, "" if kind == "full" else ".preview", ext)
+    label = "system" if typ in SYSTEM else LABELS.get(typ, "type %d" % typ)
+    return src, {"id": mid, "media": kind, "type": label, "name": name,
+                 "chat": clean(chat or user_part(jid)), "time": iso_time(date)}
+
+
+def save_media(info, write, dest):
+    """Write one media file to dest (a folder or a file path) and return its info."""
+    target = os.path.expanduser(dest or MEDIA_CACHE)
+    if dest is None or os.path.isdir(target) or dest.endswith(os.sep):
+        target = os.path.join(target, info["name"])
+    os.makedirs(os.path.dirname(os.path.abspath(target)), exist_ok=True)
+    write(target)
+    info = dict(info, path=os.path.abspath(target), bytes=os.path.getsize(target))
+    if info["media"] == "preview":
+        print("wa: only a small preview of this file is on the Mac. Open the chat in WhatsApp "
+              "for Mac to download the full file, then rerun.", file=sys.stderr)
+    return info
+
+
+def cmd_media(db, a):
+    src, info = media_row(db, a.id)
+    if a.b64:  # used over SSH: the caller writes the file on its own machine
+        with open(src, "rb") as f:
+            info = dict(info, data=base64.b64encode(f.read()).decode("ascii"))
+        return info, None
+    info = save_media(info, lambda t: shutil.copyfile(src, t), a.o)
+    return info, lambda i: i["path"]
+
+
 def cmd_status(db, a):
     msgs, chats, last = db.execute(
         "SELECT (SELECT count(*) FROM ZWAMESSAGE), (SELECT count(*) FROM ZWACHATSESSION s WHERE "
@@ -364,11 +450,12 @@ def remote_command(argv, host, timeout=30):
             "/usr/bin/env WA_LOCAL=1 WA_NOLOG=1 /usr/bin/python3 - " + shlex.join(argv)]
 
 
-def run_remote(argv, host, timeout):
+def run_remote(argv, host, timeout, capture=False):
     with open(os.path.realpath(__file__), "rb") as f:
         src = f.read()
     try:
-        p = subprocess.run(remote_command(argv, host, timeout), input=src, timeout=timeout)
+        p = subprocess.run(remote_command(argv, host, timeout), input=src, timeout=timeout,
+                           stdout=subprocess.PIPE if capture else None)
     except subprocess.TimeoutExpired:
         # A shared connection left from before the Mac slept can hang; close it so the
         # next call connects fresh.
@@ -383,7 +470,21 @@ def run_remote(argv, host, timeout):
         raise Fail(3, "the command failed on %s (exit %d)" % (host, p.returncode),
                    "check python works there: ssh %s /usr/bin/python3 --version"
                    % shlex.quote(host))
-    return p.returncode
+    return (p.returncode, p.stdout) if capture else p.returncode
+
+
+def fetch_remote_media(a, host, timeout, as_json):
+    code, out = run_remote(["media", str(a.id), "--b64", "--json"], host, timeout, capture=True)
+    if code != 0:
+        return code
+    info = json.loads(out)
+    data = base64.b64decode(info.pop("data"))
+
+    def write(target):
+        with open(target, "wb") as f:
+            f.write(data)
+    emit(save_media(info, write, a.o), lambda i: i["path"], as_json)
+    return 0
 
 
 def build_parser():
@@ -400,7 +501,8 @@ def build_parser():
         description="Read-only WhatsApp CLI over the WhatsApp for Mac database. Runs on the "
                     "Mac, or over SSH when WA_HOST is set. Times are the Mac's local time.",
         epilog="examples:\n  wa chats --unread\n  wa read 'Alice' -n 50\n"
-               "  wa search invoice --since 30d\n  wa recent --since 6h --json\n  wa status\n"
+               "  wa search invoice --since 30d\n  wa recent --since 6h --json\n"
+               "  wa media 157535\n  wa status\n"
                "  WA_HOST=my-mac wa chats\n\n"
                "Status updates, broadcasts and hidden chats are skipped.\n" + ISSUES)
     p.add_argument("--version", action="version", version="wa " + VERSION)
@@ -421,6 +523,12 @@ def build_parser():
     t.add_argument("--since", type=since_arg, default="24h", help="default 24h")
     t.add_argument("--chat", help="limit to one chat")
     t.add_argument("-n", type=positive_int, default=50, help="max messages (default 50)")
+    m = sub.add_parser("media", parents=[common],
+                       help="save one image, video, voice note or file, print its path")
+    m.add_argument("id", type=positive_int, help="message id, from [image #id] or --json")
+    m.add_argument("-o", metavar="PATH", help="folder or file to save to (default %s)"
+                   % MEDIA_CACHE)
+    m.add_argument("--b64", action="store_true", help=argparse.SUPPRESS)
     sub.add_parser("status", parents=[common], help="check access and schema, print counts")
     sub.add_parser("usage", parents=[common], help="30-day stats from this machine's usage log")
     return p
@@ -467,7 +575,7 @@ def cmd_usage(as_json):
 
 
 COMMANDS = {"chats": cmd_chats, "read": cmd_read, "search": cmd_search,
-            "recent": cmd_recent, "status": cmd_status}
+            "recent": cmd_recent, "media": cmd_media, "status": cmd_status}
 
 
 def main(argv):
@@ -491,6 +599,8 @@ def main(argv):
                 raise Fail(3, "query failed: %s" % e, "wa status, then report it at " + ISSUES)
             emit(result, fmt, as_json)
             code = 0
+        elif HOST and a.cmd == "media":
+            code = fetch_remote_media(a, HOST, timeout, as_json)
         elif HOST:
             code = run_remote(argv, HOST, timeout)
         else:

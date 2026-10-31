@@ -34,6 +34,20 @@ def ago(seconds):
     return time.time() - seconds - EPOCH
 
 
+IMG = "Media/6611111111@s.whatsapp.net/a/b/receipt.jpg"
+THUMB = "Media/6611111111@s.whatsapp.net/a/b/receipt.thumb"
+JPEG = b"\xff\xd8\xff\xe0full-image-bytes"
+PREVIEW = b"\xff\xd8\xff\xe0preview-bytes"
+
+
+def write_media(folder):
+    for rel, data in ((IMG, JPEG), (THUMB, PREVIEW)):
+        target = os.path.join(folder, "Message", rel)
+        os.makedirs(os.path.dirname(target), exist_ok=True)
+        with open(target, "wb") as f:
+            f.write(data)
+
+
 def build_db(path, drop=None):
     """Fixture DB with the columns wa reads. drop='TABLE.COL' leaves one out."""
     wa = load_wa()
@@ -65,7 +79,8 @@ def build_db(path, drop=None):
     ins("ZWAGROUPMEMBER", Z_PK=1, ZMEMBERJID="6644@s.whatsapp.net", ZCONTACTNAME="Carol")
     ins("ZWAGROUPMEMBER", Z_PK=2, ZMEMBERJID="6655@s.whatsapp.net")
     ins("ZWAPROFILEPUSHNAME", ZJID="6655@s.whatsapp.net", ZPUSHNAME="Dave P")
-    ins("ZWAMEDIAITEM", Z_PK=1, ZTITLE="receipt photo")
+    ins("ZWAMEDIAITEM", Z_PK=1, ZTITLE="receipt photo", ZMEDIALOCALPATH=IMG,
+        ZXMPPTHUMBPATH=THUMB)
     messages = [  # pk, session, me, type, date, text, group member, media
         (1, 1, 0, 0, ago(3 * 86400), "Привет, встреча завтра?", None, None),
         (2, 1, 1, 0, ago(2 * 86400), "Yes, 10am", None, None),
@@ -91,6 +106,7 @@ class WaTest(unittest.TestCase):
         cls.tmp = tempfile.TemporaryDirectory()
         cls.db = os.path.join(cls.tmp.name, "ChatStorage.sqlite")
         build_db(cls.db)
+        write_media(cls.tmp.name)
 
     @classmethod
     def tearDownClass(cls):
@@ -218,7 +234,7 @@ class WaTest(unittest.TestCase):
     def test_version(self):
         p = self.run_wa("--version")
         self.assertEqual(p.returncode, 0)
-        self.assertRegex(p.stdout, r"^wa \d{4}\.\d{1,2}\.\d{1,2}$")
+        self.assertRegex(p.stdout, r"^wa \d{4}\.\d{1,2}\.\d{1,2}(\.\d+)?$")
 
     def test_never_writes(self):
         before = hashlib.sha256(open(self.db, "rb").read()).hexdigest()
@@ -311,6 +327,92 @@ class WaTest(unittest.TestCase):
             self.assertEqual(after, before)
         finally:
             writer.close()
+
+    def test_media_messages_carry_an_id_and_file_state(self):
+        msgs = self.json_of("read", "alice smith")
+        self.assertEqual([m["id"] for m in msgs], [1, 2, 3])
+        self.assertEqual([m["media"] for m in msgs], [None, None, "full"])
+        self.assertIn("[image #3] receipt photo", self.run_wa("read", "alice smith").stdout)
+
+    def test_media_saves_full_file_and_prints_path(self):
+        out = os.path.join(self.tmp.name, "out")
+        os.makedirs(out)
+        p = self.run_wa("media", "3", "-o", out)
+        self.assertEqual(p.returncode, 0, p.stderr)
+        self.assertEqual(p.stdout.strip(), os.path.join(out, "3.jpg"))
+        self.assertEqual(open(os.path.join(out, "3.jpg"), "rb").read(), JPEG)
+        info = json.loads(self.run_wa("media", "3", "-o", out + "/x.jpg", "--json").stdout)
+        self.assertEqual((info["media"], info["type"], info["bytes"]), ("full", "image", len(JPEG)))
+
+    def test_media_default_folder_is_the_cache(self):
+        home = os.path.join(self.tmp.name, "home")
+        p = self.run_wa("media", "3", env_extra={"HOME": home})
+        self.assertEqual(p.returncode, 0, p.stderr)
+        self.assertEqual(p.stdout.strip(), os.path.join(home, ".cache/wa/media/3.jpg"))
+
+    def test_media_falls_back_to_preview(self):
+        db = self.extra_db("preview", "UPDATE ZWAMEDIAITEM SET ZMEDIALOCALPATH = NULL")
+        out = os.path.join(self.tmp.name, "prev")
+        os.makedirs(out)
+        p = self.run_wa("media", "3", "-o", out, db=db)
+        self.assertEqual(p.returncode, 0, p.stderr)
+        self.assertTrue(p.stdout.strip().endswith("3.preview.jpg"))
+        self.assertEqual(open(p.stdout.strip(), "rb").read(), PREVIEW)
+        self.assertIn("preview", p.stderr)
+
+    def test_media_errors(self):
+        self.assertEqual(self.run_wa("media", "999").returncode, 2)   # no such message
+        self.assertEqual(self.run_wa("media", "2").returncode, 2)     # a text message
+        hidden = self.extra_db("hiddenmedia", "UPDATE ZWAMESSAGE SET ZMEDIAITEM = 1, "
+                               "ZMESSAGETYPE = 1 WHERE Z_PK = 10")
+        p = self.run_wa("media", "10", db=hidden)  # an image in a hidden chat stays hidden
+        self.assertEqual(p.returncode, 2)
+        self.assertIn("no message with id 10", p.stderr)
+        gone = self.extra_db("gone", "UPDATE ZWAMEDIAITEM SET ZMEDIALOCALPATH = 'Media/x.jpg', "
+                             "ZXMPPTHUMBPATH = 'Media/x.thumb'")
+        p = self.run_wa("media", "3", db=gone)
+        self.assertEqual(p.returncode, 3)
+        self.assertIn("download", p.stderr)
+
+    def test_media_never_leaves_the_media_folder(self):
+        # A path in the database must not reach files outside Message/, such as the database.
+        for rel in ("../ChatStorage.sqlite", "/etc/hosts", "Media/../../ChatStorage.sqlite"):
+            db = self.extra_db("escape", "UPDATE ZWAMEDIAITEM SET ZMEDIALOCALPATH = '%s', "
+                               "ZXMPPTHUMBPATH = NULL" % rel)
+            out = os.path.join(self.tmp.name, "esc")
+            p = self.run_wa("media", "3", "-o", out + "/f", db=db)
+            self.assertEqual(p.returncode, 3, rel)
+            self.assertFalse(os.path.exists(out + "/f"), rel)
+            os.remove(db)
+
+    def test_media_does_not_change_whatsapp_folder(self):
+        snapshot = lambda: sorted(os.path.join(d, f) for d, _, fs in
+                                  os.walk(os.path.join(self.tmp.name, "Message")) for f in fs)
+        before = snapshot()
+        self.run_wa("media", "3", "-o", os.path.join(self.tmp.name, "copy.jpg"))
+        self.assertEqual(snapshot(), before)
+
+    def test_over_ssh_read_and_media_work_end_to_end(self):
+        # A stand-in ssh runs the remote command here, so the real quoting, the
+        # script-over-stdin path and the media transfer are all exercised.
+        bindir = os.path.join(self.tmp.name, "fakebin")
+        os.makedirs(bindir, exist_ok=True)
+        fake = os.path.join(bindir, "ssh")
+        with open(fake, "w") as f:
+            f.write('#!/bin/sh\nwhile [ "$1" != "--" ]; do shift; done\nshift 2\n'
+                    'export WA_DB="$FAKE_WA_DB"\nexec sh -c "$1"\n')
+        os.chmod(fake, 0o755)
+        env = {"WA_DB": None, "WA_LOCAL": None, "WA_HOST": "my-mac", "FAKE_WA_DB": self.db,
+               "PATH": bindir + os.pathsep + os.environ["PATH"],
+               "HOME": os.path.join(self.tmp.name, "home2")}
+        p = self.run_wa("read", "Bob's Shop", "--json", env_extra=env)
+        self.assertEqual(p.returncode, 0, p.stderr)
+        self.assertEqual(json.loads(p.stdout)[0]["text"], "order shipped")
+        out = os.path.join(self.tmp.name, "remote.jpg")
+        p = self.run_wa("media", "3", "-o", out, env_extra=env)
+        self.assertEqual(p.returncode, 0, p.stderr)
+        self.assertEqual(open(out, "rb").read(), JPEG)
+        self.assertEqual(self.run_wa("media", "999", env_extra=env).returncode, 2)
 
     def test_unexpected_error_is_exit_4_not_schema_drift(self):
         wa = load_wa()
