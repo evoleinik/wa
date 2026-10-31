@@ -26,21 +26,26 @@ protocol library. That works, but it adds an unofficial client to your account, 
 a QR re-scan every few weeks, and only sees history from the moment it links.
 
 WhatsApp for Mac already keeps your chat history in a plain SQLite file. `wa` reads it.
+[wacrawl](https://github.com/openclaw/wacrawl) reads the same file. It is the main
+alternative, and the better pick if you want an archive.
 
-| | wa | Linked-device MCP servers | WhatsApp Web automation | WhatsApp Business API |
-|---|---|---|---|---|
-| Reads personal chats | yes | yes | yes | no, business numbers only |
-| History | whatever the Mac app has synced | from link time, plus a partial sync | what the page loads | none |
-| New device on your account | no | yes, an unofficial client | no | no |
-| Talks to WhatsApp servers | no | yes | yes | yes |
-| Can send | no | yes | yes | yes |
-| Needs | WhatsApp for Mac | a Go or Node service kept running | a browser session | Meta business setup |
+| | wa | wacrawl | Linked-device MCP servers | WhatsApp Web automation | WhatsApp Business API |
+|---|---|---|---|---|---|
+| Reads personal chats | yes | yes | yes | yes | no, business numbers only |
+| History | whatever the Mac app has synced | the same, plus what it archived earlier | from link time, plus a partial sync | what the page loads | none |
+| Freshness | live file | its own archive, re-synced when over 15 minutes old | live | live | live |
+| New device on your account | no | no | yes, an unofficial client | no | no |
+| Talks to WhatsApp servers | no | no | yes | yes | yes |
+| Can send | no | no | yes | yes | yes |
+| Needs | WhatsApp for Mac | WhatsApp for Mac and its Go binary | a Go or Node service kept running | a browser session | Meta business setup |
 
 ### When not to use wa
 
 - You need to send messages. `wa` is read-only by design.
 - You have no Mac running WhatsApp. The Windows and Linux apps store data differently.
 - You need push notifications. `wa` is as fresh as the Mac app, and you ask it.
+- You want a lasting archive that keeps messages after WhatsApp drops them, a web viewer,
+  or encrypted backups. Use [wacrawl](https://github.com/openclaw/wacrawl).
 
 ## Install
 
