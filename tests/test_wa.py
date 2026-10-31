@@ -9,6 +9,7 @@ import importlib.util
 import json
 import os
 import shlex
+import shutil
 import sqlite3
 import subprocess
 import sys
@@ -414,6 +415,62 @@ class WaTest(unittest.TestCase):
         self.assertEqual(open(out, "rb").read(), JPEG)
         self.assertEqual(self.run_wa("media", "999", env_extra=env).returncode, 2)
 
+    def test_remote_command_with_launcher_sends_no_script(self):
+        wa = load_wa()
+        args = ["search", "it's a \"test\" $(rm -rf ~)", "--json"]
+        cmd = wa.remote_command(args, "my-mac", launcher="/usr/local/libexec/wa/wa-launch")
+        self.assertEqual(cmd[-3:-1], ["--", "my-mac"])
+        self.assertEqual(shlex.split(cmd[-1]), ["/usr/local/libexec/wa/wa-launch"] + args)
+
+    def test_over_ssh_with_launcher_runs_it_and_sends_no_script(self):
+        # The stand-in ssh records what it got on stdin, then runs the remote command.
+        # The stand-in launcher runs wa locally against the fixture.
+        bindir = os.path.join(self.tmp.name, "fakebin-launcher")
+        os.makedirs(bindir, exist_ok=True)
+        stdin_log = os.path.join(self.tmp.name, "ssh-stdin")
+        fake = os.path.join(bindir, "ssh")
+        with open(fake, "w") as f:
+            f.write('#!/bin/sh\nwhile [ "$1" != "--" ]; do shift; done\nshift 2\n'
+                    'cat > "$FAKE_STDIN_LOG"\nexec sh -c "$1" </dev/null\n')
+        launcher = os.path.join(bindir, "wa launch")  # a space proves the path is quoted
+        with open(launcher, "w") as f:
+            f.write('#!/bin/sh\nexec env -u WA_HOST WA_LOCAL=1 WA_DB="$FAKE_WA_DB" '
+                    '"%s" "%s" "$@"\n' % (sys.executable, os.path.abspath(WA)))
+        os.chmod(fake, 0o755)
+        os.chmod(launcher, 0o755)
+        env = {"WA_DB": None, "WA_LOCAL": None, "WA_HOST": "my-mac", "WA_LAUNCHER": launcher,
+               "FAKE_WA_DB": self.db, "FAKE_STDIN_LOG": stdin_log,
+               "PATH": bindir + os.pathsep + os.environ["PATH"],
+               "HOME": os.path.join(self.tmp.name, "home3")}
+        p = self.run_wa("read", "Bob's Shop", "--json", env_extra=env)
+        self.assertEqual(p.returncode, 0, p.stderr)
+        self.assertEqual(json.loads(p.stdout)[0]["text"], "order shipped")
+        self.assertEqual(os.path.getsize(stdin_log), 0)
+        out = os.path.join(self.tmp.name, "launched.jpg")
+        p = self.run_wa("media", "3", "-o", out, env_extra=env)
+        self.assertEqual(p.returncode, 0, p.stderr)
+        self.assertEqual(open(out, "rb").read(), JPEG)
+        env["WA_LAUNCHER"] = os.path.join(bindir, "missing-launcher")
+        p = self.run_wa("status", env_extra=env)
+        self.assertEqual(p.returncode, 3)
+        self.assertIn("missing-launcher --version", p.stderr)
+
+    def test_access_denied_hint_names_the_launcher(self):
+        locked = os.path.join(self.tmp.name, "locked")
+        os.makedirs(locked, exist_ok=True)
+        os.chmod(locked, 0)
+        try:
+            if os.access(locked, os.R_OK):
+                self.skipTest("running as root, so the folder is still readable")
+            db = os.path.join(locked, "ChatStorage.sqlite")
+            p = self.run_wa("status", db=db, env_extra={"WA_LAUNCHER": "/opt/x/wa-launch"})
+            self.assertEqual(p.returncode, 3)
+            self.assertIn("Full Disk Access: add /opt/x/wa-launch", p.stderr)
+            p = self.run_wa("status", db=db, env_extra={"WA_LAUNCHER": None})
+            self.assertIn("set WA_LAUNCHER", p.stderr)
+        finally:
+            os.chmod(locked, 0o755)
+
     def test_unexpected_error_is_exit_4_not_schema_drift(self):
         wa = load_wa()
         boom = lambda db, a: 1 / 0
@@ -421,6 +478,77 @@ class WaTest(unittest.TestCase):
                 unittest.mock.patch.dict(wa.COMMANDS, {"status": boom}), \
                 unittest.mock.patch("sys.stderr"):
             self.assertEqual(wa.main(["status"]), 4)
+
+
+LAUNCHER_SRC = os.path.join(os.path.dirname(os.path.abspath(WA)), "..", "launcher",
+                            "wa-launch.c")
+
+
+@unittest.skipUnless(sys.platform == "darwin" and shutil.which("cc"), "macOS with cc only")
+class LauncherTest(unittest.TestCase):
+    """wa-launch, compiled for real. The green path needs passwordless sudo (CI has it)."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.tmp = tempfile.TemporaryDirectory()
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.tmp.cleanup()
+
+    def build(self, script):
+        out = os.path.join(self.tmp.name, "wa-launch-%d" % abs(hash(script)))
+        subprocess.run(["cc", "-O2", "-Wall", "-Wextra", "-Werror", '-DWA_SCRIPT="%s"' % script,
+                        "-o", out, LAUNCHER_SRC], check=True)
+        return out
+
+    def run_launcher(self, exe, *args, env=None):
+        return subprocess.run([exe] + list(args), capture_output=True, text=True, timeout=30,
+                              env=env if env is not None else dict(os.environ))
+
+    def test_refuses_a_script_you_could_edit(self):
+        script = os.path.join(self.tmp.name, "wa")
+        shutil.copy(WA, script)
+        p = self.run_launcher(self.build(script), "--version")
+        self.assertEqual(p.returncode, 3, p.stderr)
+        self.assertIn("refusing to run", p.stderr)
+        self.assertIn(self.tmp.name.split("/")[-1], p.stderr)
+
+    def test_refuses_output_paths(self):
+        exe = self.build("/usr/local/libexec/wa/wa")
+        for args in (["media", "3", "-o", "/tmp/x"], ["media", "3", "-o/tmp/x"]):
+            p = self.run_launcher(exe, *args)
+            self.assertEqual(p.returncode, 2, args)
+            self.assertIn("-o is refused", p.stderr)
+
+    def test_runs_root_owned_wa_with_a_cleared_environment(self):
+        if subprocess.run(["sudo", "-n", "true"], capture_output=True).returncode != 0:
+            self.skipTest("needs passwordless sudo to make a root-owned folder")
+        folder = "/usr/local/libexec/wa-test-%d" % os.getpid()
+        subprocess.run(["sudo", "install", "-d", "-o", "root", "-g", "wheel", "-m", "755",
+                        "/usr/local/libexec", folder], check=True)
+        try:
+            subprocess.run(["sudo", "install", "-o", "root", "-g", "wheel", "-m", "644", WA,
+                            folder + "/wa"], check=True)
+            exe = self.build(folder + "/wa")
+            p = self.run_launcher(exe, "--version")
+            self.assertEqual(p.returncode, 0, p.stderr)
+            self.assertRegex(p.stdout, r"^wa \d{4}\.")
+            # A fixture database in WA_DB must not reach wa: the launcher clears the
+            # environment, so wa looks in this user's own WhatsApp folder instead.
+            fixture = os.path.join(self.tmp.name, "ChatStorage.sqlite")
+            build_db(fixture)
+            env = dict(os.environ, WA_DB=fixture, WA_HOST="", PYTHONPATH="/nowhere")
+            p = self.run_launcher(exe, "status", "--json", env=env)
+            self.assertNotEqual(p.returncode, 0, p.stdout)
+            self.assertNotIn(fixture, p.stdout + p.stderr)
+            # Root-owned is not enough: a folder your group can write is refused too.
+            subprocess.run(["sudo", "chmod", "775", folder], check=True)
+            p = self.run_launcher(exe, "--version")
+            self.assertEqual(p.returncode, 3, p.stdout)
+            self.assertIn("refusing to run", p.stderr)
+        finally:
+            subprocess.run(["sudo", "rm", "-rf", folder], check=True)
 
 
 if __name__ == "__main__":

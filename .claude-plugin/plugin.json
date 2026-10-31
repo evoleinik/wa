@@ -1,6 +1,6 @@
 {
   "name": "wa",
-  "version": "2026.10.31.1",
+  "version": "2026.10.31.2",
   "description": "Read-only WhatsApp for Claude: the wa CLI and a skill over the WhatsApp for Mac database. No linked device, no QR code.",
   "author": {
     "name": "Evgeny Oleynik",

@@ -6,6 +6,10 @@ the Mac's SSH host: wa sends itself over SSH and the query runs there, so the
 database stays on the Mac and only printed rows cross SSH. It never writes the
 database: it opens it with mode=ro and PRAGMA query_only.
 
+Over SSH, macOS only lets wa in when sshd has Full Disk Access, and that grant covers
+every SSH login. Set WA_LAUNCHER to the path of launcher/wa-launch on the Mac instead:
+wa then runs that small signed program over SSH, and only it holds the grant.
+
 `wa media <id>` is the one command that writes, and only a copy of one media file,
 into ~/.cache/wa/media or the -o path, on the machine running wa.
 
@@ -32,14 +36,20 @@ from datetime import datetime
 
 DEFAULT_DB = os.path.expanduser(
     "~/Library/Group Containers/group.net.whatsapp.WhatsApp.shared/ChatStorage.sqlite")
-VERSION = "2026.10.31.1"
+VERSION = "2026.10.31.2"
 HOST = os.environ.get("WA_HOST")  # SSH host of the Mac; unset means read locally
+# Path of wa-launch on the Mac. wa-launch also sets it for the wa it runs, so hints name it.
+LAUNCHER = os.environ.get("WA_LAUNCHER")
 USAGE_LOG = os.path.expanduser("~/.wa/usage.jsonl")
 MEDIA_CACHE = "~/.cache/wa/media"  # expanded at use, so HOME can change in tests
 MEDIA_DIR = "Message"  # media paths in the database are relative to this folder
 EPOCH = 978307200  # Core Data dates count seconds from 2001-01-01 UTC.
 FDA_FIX = ("on the Mac, System Settings > Privacy & Security > Full Disk Access: add your "
-           "terminal app, or /usr/libexec/sshd-keygen-wrapper when reading over SSH")
+           "terminal app, or set WA_LAUNCHER and add wa-launch when reading over SSH "
+           "(see launcher/install.sh)")
+if LAUNCHER:
+    FDA_FIX = ("on the Mac, System Settings > Privacy & Security > Full Disk Access: add %s"
+               % LAUNCHER)
 ISSUES = "https://github.com/evoleinik/wa/issues"
 
 # Every column the queries read. A WhatsApp update that drops one reds every command.
@@ -439,23 +449,27 @@ def emit(result, fmt, as_json):
 CONTROL_PATH = os.path.expanduser("~/.ssh/wa-%C")
 
 
-def remote_command(argv, host, timeout=30):
-    """The ssh argv that runs this same script on host with the given arguments."""
+def remote_command(argv, host, timeout=30, launcher=None):
+    """The ssh argv that runs wa on host: this script over stdin, or the installed launcher."""
     # One shared SSH connection, kept 10 minutes, turns a ~2 s call into a ~0.5 s one.
     # Keepalives drop it within ~10 s once the Mac sleeps, instead of hanging every call.
     return ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=%d" % min(timeout, 15),
             "-o", "ServerAliveInterval=5", "-o", "ServerAliveCountMax=2",
             "-o", "ControlMaster=auto", "-o", "ControlPersist=10m",
             "-o", "ControlPath=" + CONTROL_PATH, "--", host,
+            shlex.join([launcher] + argv) if launcher else
             "/usr/bin/env WA_LOCAL=1 WA_NOLOG=1 /usr/bin/python3 - " + shlex.join(argv)]
 
 
 def run_remote(argv, host, timeout, capture=False):
-    with open(os.path.realpath(__file__), "rb") as f:
-        src = f.read()
+    if LAUNCHER:
+        src = b""  # the launcher runs its own installed copy of wa
+    else:
+        with open(os.path.realpath(__file__), "rb") as f:
+            src = f.read()
     try:
-        p = subprocess.run(remote_command(argv, host, timeout), input=src, timeout=timeout,
-                           stdout=subprocess.PIPE if capture else None)
+        p = subprocess.run(remote_command(argv, host, timeout, LAUNCHER), input=src,
+                           timeout=timeout, stdout=subprocess.PIPE if capture else None)
     except subprocess.TimeoutExpired:
         # A shared connection left from before the Mac slept can hang; close it so the
         # next call connects fresh.
@@ -467,9 +481,9 @@ def run_remote(argv, host, timeout, capture=False):
         raise Fail(3, "cannot reach %s over SSH" % host,
                    "check the Mac is awake: ssh %s true" % shlex.quote(host))
     if p.returncode not in (0, 1, 2, 3, 4):
+        check = shlex.join([LAUNCHER, "--version"]) if LAUNCHER else "/usr/bin/python3 --version"
         raise Fail(3, "the command failed on %s (exit %d)" % (host, p.returncode),
-                   "check python works there: ssh %s /usr/bin/python3 --version"
-                   % shlex.quote(host))
+                   "check it runs there: ssh %s %s" % (shlex.quote(host), check))
     return (p.returncode, p.stdout) if capture else p.returncode
 
 

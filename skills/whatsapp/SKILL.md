@@ -59,7 +59,9 @@ archived, pinned, preview}`. Text output shortens long messages, so quote from `
 - Installed as a Claude Code plugin, `wa` is on PATH. If it is not found, ask the user to
   start a new session.
 - Off the Mac, wa reads over SSH when the `WA_HOST` environment variable names the Mac.
-  The user sets it once, for example `export WA_HOST=my-mac` in their shell profile.
+  The user sets it once, for example `export WA_HOST=my-mac` in their shell profile. With
+  the launcher installed on the Mac, `WA_LAUNCHER` names it too. Never suggest giving sshd
+  Full Disk Access yourself. Point to https://github.com/evoleinik/wa#read-from-another-machine-over-ssh.
 - Otherwise point the user to https://github.com/evoleinik/wa#install.
 
 ## Privacy

@@ -84,12 +84,40 @@ export WA_HOST=my-mac    # any ssh host or alias
 wa chats
 ```
 
-`wa` sends itself to the Mac over SSH and runs there under `/usr/bin/python3`. The
-database stays on the Mac, and only the rows a command prints cross the SSH connection.
-Install `wa` only on the machine you run it from. On the Mac, turn on Remote Login and add
-`/usr/libexec/sshd-keygen-wrapper` to Full Disk Access. Repeat calls share one SSH
-connection and take about half a second. `wa media` brings the file back over the same
-connection and saves it on the machine you run `wa` from.
+The database stays on the Mac, and only the rows a command prints cross the SSH
+connection. Turn on Remote Login on the Mac. Repeat calls share one SSH connection and take
+about half a second. `wa media` brings the file back over the same connection and saves it
+on the machine you run `wa` from.
+
+macOS still has to let SSH read WhatsApp's folder. There are two ways:
+
+- **Launcher, recommended.** A small signed program on the Mac holds Full Disk Access, and
+  nothing else does. It runs only a root-owned copy of `wa`. On the Mac, from a checkout of
+  this repo:
+
+  ```bash
+  ./launcher/install.sh
+  ```
+
+  It asks for your password once. Then add `/usr/local/libexec/wa/wa-launch` to Full Disk
+  Access, as the script prints. On the machine you run `wa` from:
+
+  ```bash
+  export WA_LAUNCHER=/usr/local/libexec/wa/wa-launch
+  ```
+
+  Run `install.sh` again after updating `wa`, so the copy on the Mac matches.
+- **Simpler and wider.** Add `/usr/libexec/sshd-keygen-wrapper` to Full Disk Access, and
+  `wa` sends itself over SSH. That grant covers every SSH login, so any SSH session can
+  then read Mail, Messages and every other app's data.
+
+The launcher works because macOS checks Full Disk Access against the process responsible
+for a request, and over SSH that is sshd. `wa-launch` re-executes itself as its own
+responsible process before it starts `wa`. It uses an undocumented macOS call to do that.
+If an update breaks the call, `wa` exits 3 and reads nothing. `wa-launch` also refuses to
+run unless its copy of `wa`, and every folder above it, are owned and writable only by
+root. It clears the environment and refuses `-o`. Design notes:
+[docs/plans/2026-10-31-ssh-without-full-disk-access.md](docs/plans/2026-10-31-ssh-without-full-disk-access.md).
 
 ## Commands
 
@@ -172,6 +200,8 @@ python3 tests/test_wa.py
 
 `bin/wa` is the whole tool. Keep it Python 3.9 compatible, because that is the
 `/usr/bin/python3` macOS ships. The tests build a fixture database with WhatsApp's schema.
+On macOS they also compile `launcher/wa-launch.c` and check that it refuses unsafe setups.
+Its full run needs passwordless `sudo`, which CI has.
 
 ## License
 
