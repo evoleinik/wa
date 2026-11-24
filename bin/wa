@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""wa - read-only WhatsApp CLI over the WhatsApp for Mac database.
+"""wa - WhatsApp CLI over the WhatsApp for Mac database: reads, and sends one message on --yes.
 
 On the Mac it reads the database in place. From another machine, set WA_HOST to
 the Mac's SSH host: wa sends itself over SSH and the query runs there, so the
@@ -13,9 +13,13 @@ wa then runs that small signed program over SSH, and only it holds the grant.
 `wa media <id>` is the one command that writes, and only a copy of one media file,
 into ~/.cache/wa/media or the -o path, on the machine running wa.
 
+`wa send` sends one message through WhatsApp for Mac, only with --yes. It opens
+whatsapp://send, checks the composer holds the text, presses Send through
+Accessibility, and reads the message back from the database.
+
 Exit codes: 0 ok (empty results print a hint to stderr), 1 WhatsApp changed its
-database schema, 2 bad arguments or no single chat matched, 3 cannot reach the
-host or read the database, 4 a bug in wa.
+database schema or its window, 2 bad arguments or no single chat matched, 3 cannot
+reach the host or read the database, 4 a bug in wa, 5 sent but not confirmed.
 
 Python 3.9 compatible, because macOS ships /usr/bin/python3 3.9.
 https://github.com/evoleinik/wa
@@ -36,7 +40,7 @@ from datetime import datetime
 
 DEFAULT_DB = os.path.expanduser(
     "~/Library/Group Containers/group.net.whatsapp.WhatsApp.shared/ChatStorage.sqlite")
-VERSION = "2026.10.31.2"
+VERSION = "2026.11.24.1"
 HOST = os.environ.get("WA_HOST")  # SSH host of the Mac; unset means read locally
 # Path of wa-launch on the Mac. wa-launch also sets it for the wa it runs, so hints name it.
 LAUNCHER = os.environ.get("WA_LAUNCHER")
@@ -432,6 +436,329 @@ def cmd_status(db, a):
         o["messages"], o["chats"], o["latest"], o["size_mb"])
 
 
+# --- send -----------------------------------------------------------------------------
+# wa sends through WhatsApp for Mac itself: it opens whatsapp://send, checks the composer
+# holds exactly the text, presses the Send button through Accessibility, then reads the
+# message back from the database. No second device, no unofficial client.
+
+SEND_GAP = 60  # seconds between two sends, so wa never sends from a loop
+SEND_STAMP = "~/.wa/last-send"  # on the machine that runs wa, never under wa-launch
+UI_WAIT = 15  # seconds to wait for the chat to open
+READBACK_WAIT = 20  # seconds to wait for the sent message to reach the database
+AX_FIX = ("on the Mac, System Settings > Privacy & Security > Accessibility: add %s"
+          % (LAUNCHER or "your terminal app"))
+
+
+def norm(text):
+    return " ".join((text or "").split())
+
+
+def phone_digits(s):
+    """Digits of a phone number with country code, or None when s is not a phone number."""
+    if not re.fullmatch(r"\+?[\d\s().-]+", s):
+        return None
+    digits = re.sub(r"\D", "", s)
+    if s.lstrip().startswith("0") or not 8 <= len(digits) <= 15:
+        raise Fail(2, "%r is not a full phone number" % s,
+                   "write it with the country code, like +62 852 8382 6458")
+    return digits
+
+
+def send_target(db, to):
+    """Resolve <to> to {phone, jid, name, new_chat}. Only direct chats with a phone JID."""
+    digits = phone_digits(to)
+    if digits:
+        jid = digits + "@s.whatsapp.net"
+        row = db.execute("SELECT s.ZPARTNERNAME FROM ZWACHATSESSION s WHERE s.ZCONTACTJID = ? "
+                         "AND " + CHAT_FILTER, [jid]).fetchone()
+        return {"phone": "+" + digits, "jid": jid, "name": clean(row[0]) if row else None,
+                "new_chat": row is None}
+    _, name, jid = resolve_chat(db, to)
+    if not (jid or "").endswith("@s.whatsapp.net"):
+        raise Fail(2, "%s (%s) is not a direct chat with a phone number" % (clean(name), jid),
+                   "wa send sends to one person: pass their number, like +62 852 8382 6458")
+    return {"phone": "+" + user_part(jid), "jid": jid, "name": clean(name), "new_chat": False}
+
+
+def send_text(a):
+    if a.text_file is not None:
+        try:
+            with open(a.text_file, encoding="utf-8") as f:
+                a.text = f.read()
+        except (OSError, UnicodeDecodeError) as e:
+            raise Fail(2, "cannot read --text-file: %s" % e)
+        a.text_file = None
+    text = (a.text or "").strip("\n")
+    if not text.strip():
+        raise Fail(2, "the message is empty", "pass --text '...' or --text-file FILE")
+    return text
+
+
+class AX:
+    """The few Accessibility and CoreFoundation calls wa needs, through ctypes."""
+    UTF8 = 0x08000100
+
+    def __init__(self):
+        import ctypes
+        self.c = ctypes
+        cf = ctypes.cdll.LoadLibrary(
+            "/System/Library/Frameworks/CoreFoundation.framework/CoreFoundation")
+        ax = ctypes.cdll.LoadLibrary(
+            "/System/Library/Frameworks/ApplicationServices.framework/ApplicationServices")
+        vp, i32, lng = ctypes.c_void_p, ctypes.c_int32, ctypes.c_long
+        for fn, res, args in (
+                (cf.CFStringCreateWithCString, vp, [vp, ctypes.c_char_p, ctypes.c_uint32]),
+                (cf.CFStringGetLength, lng, [vp]),
+                (cf.CFStringGetCString, ctypes.c_bool, [vp, ctypes.c_char_p, lng, ctypes.c_uint32]),
+                (cf.CFGetTypeID, ctypes.c_ulong, [vp]),
+                (cf.CFStringGetTypeID, ctypes.c_ulong, []),
+                (cf.CFArrayGetTypeID, ctypes.c_ulong, []),
+                (cf.CFArrayGetCount, lng, [vp]),
+                (cf.CFArrayGetValueAtIndex, vp, [vp, lng]),
+                (ax.AXIsProcessTrusted, ctypes.c_bool, []),
+                (ax.AXUIElementCreateApplication, vp, [i32]),
+                (ax.AXUIElementCopyAttributeValue, i32, [vp, vp, ctypes.POINTER(vp)]),
+                (ax.AXUIElementPerformAction, i32, [vp, vp]),
+                (ax.AXUIElementSetMessagingTimeout, i32, [vp, ctypes.c_float])):
+            fn.restype, fn.argtypes = res, args
+        self.cf, self.ax = cf, ax
+        self.str_type, self.arr_type = cf.CFStringGetTypeID(), cf.CFArrayGetTypeID()
+        self.names = {}
+
+    def cfstr(self, s):
+        if s not in self.names:  # kept for the life of the process
+            self.names[s] = self.cf.CFStringCreateWithCString(None, s.encode(), self.UTF8)
+        return self.names[s]
+
+    def pystr(self, ref):
+        size = self.cf.CFStringGetLength(ref) * 4 + 1
+        buf = self.c.create_string_buffer(size)
+        if not self.cf.CFStringGetCString(ref, buf, size, self.UTF8):
+            return None
+        return buf.value.decode("utf-8", "replace")
+
+    def trusted(self):
+        return bool(self.ax.AXIsProcessTrusted())
+
+    def app(self, pid):
+        el = self.ax.AXUIElementCreateApplication(pid)
+        self.ax.AXUIElementSetMessagingTimeout(el, 2.0)
+        return el
+
+    def get(self, el, attr):
+        """A string, a list of elements, another element, or None. Never frees: wa is short-lived."""
+        out = self.c.c_void_p()
+        if self.ax.AXUIElementCopyAttributeValue(el, self.cfstr(attr), self.c.byref(out)) != 0 \
+                or not out.value:
+            return None
+        tid = self.cf.CFGetTypeID(out.value)
+        if tid == self.str_type:
+            return self.pystr(out.value)
+        if tid == self.arr_type:
+            return [self.cf.CFArrayGetValueAtIndex(out.value, i)
+                    for i in range(self.cf.CFArrayGetCount(out.value))]
+        return out.value
+
+    def press(self, el):
+        return self.ax.AXUIElementPerformAction(el, self.cfstr("AXPress")) == 0
+
+    def walk(self, el, limit=6000):
+        """Every element under el, breadth first, each with its parent chain."""
+        queue, seen = [(el, ())], 0
+        while queue and seen < limit:
+            node, up = queue.pop(0)
+            seen += 1
+            yield node, up
+            for child in self.get(node, "AXChildren") or []:
+                queue.append((child, up + (node,)))
+
+    def label(self, el):
+        return " ".join(filter(None, (self.get(el, k) for k in (
+            "AXDescription", "AXTitle", "AXIdentifier", "AXHelp"))))
+
+
+def whatsapp_pid():
+    p = subprocess.run(["/usr/bin/pgrep", "-x", "WhatsApp"], capture_output=True, text=True)
+    pids = p.stdout.split()
+    return int(pids[0]) if pids else None
+
+
+def screen_locked():
+    import plistlib
+    try:
+        out = subprocess.run(["/usr/sbin/ioreg", "-n", "Root", "-d1", "-a"],
+                             capture_output=True, timeout=10).stdout
+        users = plistlib.loads(out).get("IOConsoleUsers", [])
+    except Exception:
+        return False  # cannot tell; the composer check below still guards the send
+    return any(u.get("CGSSessionScreenIsLocked") for u in users)
+
+
+SEND_WORDS = re.compile(r"^send$|\bsend\b(?!.*\b(voice|audio|sticker|gif|photo|file)\b)", re.I)
+REFUSED = re.compile(r"invalid|not on whatsapp|isn.t on whatsapp", re.I)
+
+
+def ancestors(ax, el):
+    up = []
+    while len(up) < 15:
+        el = ax.get(el, "AXParent")
+        if not el or isinstance(el, (str, list)):
+            break
+        up.append(el)
+    return up[::-1]  # root first, like walk()
+
+
+def is_composer(ax, el, want):
+    value = ax.get(el, "AXValue")
+    return (isinstance(value, str) and norm(value) == want
+            and ax.get(el, "AXRole") in ("AXTextArea", "AXTextField"))
+
+
+def find_composer(ax, pid, text):
+    """(composer, send button, buttons, refusal) in the chat whose composer holds text.
+
+    The chat opened by the URL usually has the composer focused, so that is tried first.
+    Otherwise every window is walked. buttons lists button labels for the failure message.
+    It never collects message text, except a WhatsApp line that refuses the number.
+    """
+    want, app = norm(text), ax.app(pid)
+    focused = ax.get(app, "AXFocusedUIElement")
+    if focused and not isinstance(focused, (str, list)) and is_composer(ax, focused, want):
+        return focused, nearest_send(ax, ancestors(ax, focused)), [], None
+    buttons, refusal = [], None
+    for win in ax.get(app, "AXWindows") or []:
+        for el, up in ax.walk(win):
+            role = ax.get(el, "AXRole")
+            if role == "AXButton":
+                buttons.append(ax.label(el) or "(no label)")
+            elif role == "AXStaticText" and not refusal:
+                line = ax.get(el, "AXValue") or ""
+                refusal = line[:120] if isinstance(line, str) and REFUSED.search(line) else None
+            elif is_composer(ax, el, want):
+                return el, nearest_send(ax, up), buttons, None
+    return None, None, buttons, refusal
+
+
+def nearest_send(ax, up):
+    """The Send button closest to the composer: search its ancestors, nearest first."""
+    for parent in reversed(up[-6:]):
+        for el, _ in ax.walk(parent, limit=400):
+            if ax.get(el, "AXRole") == "AXButton" and SEND_WORDS.search(ax.label(el)):
+                return el
+    return None
+
+
+def press_send(target, text):
+    """Open the chat with the text, check the composer, press Send. Raises Fail if nothing sent."""
+    if sys.platform != "darwin":
+        raise Fail(3, "sending needs WhatsApp for Mac", "set WA_HOST to the Mac's SSH host")
+    ax = AX()
+    if not ax.trusted():
+        raise Fail(3, "macOS has not given wa Accessibility, so it cannot press Send. "
+                   "Nothing was sent.", AX_FIX)
+    if screen_locked():
+        raise Fail(3, "the Mac's screen is locked. Nothing was sent.", "unlock the Mac, then rerun")
+    url = "whatsapp://send?" + urllib.parse.urlencode(
+        {"phone": target["phone"].lstrip("+"), "text": text}, quote_via=urllib.parse.quote)
+    if subprocess.run(["/usr/bin/open", "-g", url], capture_output=True).returncode != 0:
+        raise Fail(3, "macOS could not open WhatsApp. Nothing was sent.",
+                   "open WhatsApp for Mac and sign in, then rerun")
+    deadline, buttons = time.time() + UI_WAIT, []
+    while time.time() < deadline:
+        time.sleep(0.5)
+        pid = whatsapp_pid()
+        if not pid:
+            continue
+        composer, button, buttons, refusal = find_composer(ax, pid, text)
+        if composer and not button:
+            raise Fail(1, "WhatsApp changed its window: no Send button next to the message. "
+                       "Nothing was sent; the text is waiting in the chat.",
+                       "press Send in WhatsApp yourself, or report it at " + ISSUES)
+        if button:
+            if not ax.press(button):
+                raise Fail(1, "WhatsApp refused the Send press. Nothing was sent; the text is "
+                           "waiting in the chat.", "press Send in WhatsApp yourself")
+            return
+        if refusal:
+            raise Fail(2, "WhatsApp cannot reach %s. It says: %s. Nothing was sent."
+                       % (target["phone"], clean(refusal)), "check the number and its country code")
+    raise Fail(1, "the chat did not open with the message in %ds. Nothing was sent. "
+               "WhatsApp's buttons: %s" % (UI_WAIT, ", ".join(buttons[:40]) or "(no window)"),
+               "open WhatsApp for Mac, check it is signed in, then rerun")
+
+
+def read_back(after_pk, target, text):
+    """The sent message's row once it is in the database, or None after READBACK_WAIT.
+
+    It opens the database again on every try. A connection opened while WhatsApp was quit
+    reads a frozen snapshot, and the URL may have just started WhatsApp.
+    """
+    want, deadline = norm(text), time.time() + READBACK_WAIT
+    sql = ("SELECT m.Z_PK, m.ZMESSAGEDATE, s.ZCONTACTJID, s.ZPARTNERNAME, m.ZTEXT "
+           "FROM ZWAMESSAGE m JOIN ZWACHATSESSION s ON s.Z_PK = m.ZCHATSESSION "
+           "WHERE m.Z_PK > ? AND m.ZISFROMME = 1 ORDER BY m.Z_PK")
+    while time.time() < deadline:
+        db = connect(os.environ.get("WA_DB", DEFAULT_DB))
+        rows = db.execute(sql, [after_pk]).fetchall()
+        db.close()
+        for pk, date, jid, name, body in rows:
+            if norm(body) == want:
+                return {"id": pk, "time": iso_time(date), "jid": jid,
+                        "chat": clean(name or user_part(jid)),
+                        "same_chat": jid == target["jid"] or (jid or "").endswith("@lid")}
+        time.sleep(1)
+    return None
+
+
+def cmd_send(db, a):
+    text = send_text(a)
+    target = send_target(db, a.to)
+    out = dict(target, text=text, chars=len(text), sent=False)
+    if not a.yes:
+        return out, lambda o: "To:   %s (%s)\nText: %s" % (
+            o["phone"], o["name"] or "new chat",
+            "\n      ".join(clean(line) for line in o["text"].split("\n")))
+    after = db.execute("SELECT coalesce(max(Z_PK), 0) FROM ZWAMESSAGE").fetchone()[0]
+    press_send(target, text)
+    got = read_back(after, target, text)
+    if not got or not got["same_chat"]:
+        where = "it is not in the database after %ds" % READBACK_WAIT if not got else \
+            "it showed up in %s (%s), not %s" % (got["chat"], got["jid"], target["jid"])
+        raise Fail(5, "WhatsApp took the Send press, but %s." % where,
+                   "check the chat yourself: wa read %s -n 3" % shlex.quote(target["phone"]))
+    out = dict(out, sent=True, confirmed=True, id=got["id"], time=got["time"],
+               jid=got["jid"], name=got["chat"])
+    return out, lambda o: "sent and confirmed: %s %s #%d" % (o["time"], o["phone"], o["id"])
+
+
+def send_guard(a, as_json):
+    """On the caller's machine, before wa send. Returns (stamp, argv to run on the Mac).
+
+    It reads --text-file here, so a file on this machine works over SSH. With --yes it
+    refuses a second send within SEND_GAP seconds, so wa never sends from a loop.
+    """
+    forward = ["send", "--text=" + send_text(a)] + (["--yes"] if a.yes else []) \
+        + (["--json"] if as_json else []) + ["--", a.to]
+    if not a.yes:
+        return None, forward
+    stamp = os.path.expanduser(SEND_STAMP)
+    try:
+        ago = time.time() - os.path.getmtime(stamp)
+    except OSError:
+        ago = None
+    if ago is not None and 0 <= ago < SEND_GAP:
+        raise Fail(2, "wa sent a message %ds ago. It sends one message at a time and never "
+                   "from a loop." % ago, "wait %ds, then rerun" % (SEND_GAP - ago + 1))
+    return stamp, forward
+
+
+def mark_sent(stamp):
+    if stamp:
+        os.makedirs(os.path.dirname(stamp), exist_ok=True)
+        with open(stamp, "w") as f:
+            f.write(datetime.now().astimezone().isoformat(timespec="seconds") + "\n")
+
+
 def hint(what, tries):
     print("%s Try: %s" % (what, tries), file=sys.stderr)
 
@@ -481,7 +808,7 @@ def run_remote(argv, host, timeout, capture=False):
     if p.returncode == 255:
         raise Fail(3, "cannot reach %s over SSH" % host,
                    "check the Mac is awake: ssh %s true" % shlex.quote(host))
-    if p.returncode not in (0, 1, 2, 3, 4):
+    if p.returncode not in (0, 1, 2, 3, 4, 5):
         check = shlex.join([LAUNCHER, "--version"]) if LAUNCHER else "/usr/bin/python3 --version"
         raise Fail(3, "the command failed on %s (exit %d)" % (host, p.returncode),
                    "check it runs there: ssh %s %s" % (shlex.quote(host), check))
@@ -513,11 +840,14 @@ def build_parser():
                      help="include group events and unlabeled message types")
     p = argparse.ArgumentParser(
         prog="wa", parents=[common], formatter_class=argparse.RawDescriptionHelpFormatter,
-        description="Read-only WhatsApp CLI over the WhatsApp for Mac database. Runs on the "
-                    "Mac, or over SSH when WA_HOST is set. Times are the Mac's local time.",
+        description="WhatsApp CLI over the WhatsApp for Mac database. It reads, and sends one "
+                    "message only with send --yes. Runs on the Mac, or over SSH when WA_HOST "
+                    "is set. Times are the Mac's local time.",
         epilog="examples:\n  wa chats --unread\n  wa read 'Alice' -n 50\n"
                "  wa search invoice --since 30d\n  wa recent --since 6h --json\n"
                "  wa media 157535\n  wa status\n"
+               "  wa send +6285283826458 --text-file msg.txt         # preview, sends nothing\n"
+               "  wa send +6285283826458 --text-file msg.txt --yes   # send and confirm\n"
                "  WA_HOST=my-mac wa chats\n\n"
                "Status updates, broadcasts and hidden chats are skipped.\n" + ISSUES)
     p.add_argument("--version", action="version", version="wa " + VERSION)
@@ -544,6 +874,14 @@ def build_parser():
     m.add_argument("-o", metavar="PATH", help="folder or file to save to (default %s)"
                    % MEDIA_CACHE)
     m.add_argument("--b64", action="store_true", help=argparse.SUPPRESS)
+    w = sub.add_parser("send", parents=[common],
+                       help="send one message through WhatsApp for Mac; previews without --yes")
+    w.add_argument("to", help="phone number with country code, or a direct chat's name or JID")
+    body = w.add_mutually_exclusive_group(required=True)
+    body.add_argument("--text", help="the message")
+    body.add_argument("--text-file", metavar="FILE", help="read the message from a UTF-8 file")
+    w.add_argument("--yes", action="store_true",
+                   help="really send it, then confirm it in the database (exit 5 if not)")
     sub.add_parser("status", parents=[common], help="check access and schema, print counts")
     sub.add_parser("usage", parents=[common], help="30-day stats from this machine's usage log")
     return p
@@ -590,7 +928,7 @@ def cmd_usage(as_json):
 
 
 COMMANDS = {"chats": cmd_chats, "read": cmd_read, "search": cmd_search,
-            "recent": cmd_recent, "media": cmd_media, "status": cmd_status}
+            "recent": cmd_recent, "media": cmd_media, "status": cmd_status, "send": cmd_send}
 
 
 def main(argv):
@@ -612,8 +950,10 @@ def main(argv):
     # Full Disk Access error names the fix. Off a Mac, WA_HOST is the only way in.
     local = (os.environ.get("WA_LOCAL") == "1" or "WA_DB" in os.environ
              or os.path.exists(path) or (not HOST and sys.platform == "darwin"))
-    start = time.time()
+    start, stamp = time.time(), None
     try:
+        if a.cmd == "send" and not os.environ.get("WA_LOCAL"):
+            stamp, forward = send_guard(a, as_json)  # the machine you typed wa send on
         if local:
             db = connect(path)
             try:
@@ -624,6 +964,8 @@ def main(argv):
             code = 0
         elif HOST and a.cmd == "media":
             code = fetch_remote_media(a, HOST, timeout, as_json)
+        elif HOST and a.cmd == "send":
+            code = run_remote(forward, HOST, max(timeout, UI_WAIT + READBACK_WAIT + 30))
         elif HOST:
             code = run_remote(argv, HOST, timeout)
         else:
@@ -640,6 +982,12 @@ def main(argv):
         print("wa: unexpected %s: %s" % (type(e).__name__, e), file=sys.stderr)
         print("Try: report it at " + ISSUES, file=sys.stderr)
         code = 4
+    if a.cmd == "send" and not os.environ.get("WA_LOCAL"):
+        if code in (0, 5) and stamp:
+            mark_sent(stamp)  # 5 may have sent, so it counts toward the gap too
+        elif code == 0:
+            sys.stdout.flush()
+            print("Not sent. To send it: " + shlex.join(["wa"] + argv + ["--yes"]), file=sys.stderr)
     log_usage(a.cmd, code, int((time.time() - start) * 1000), not local)
     return code
 

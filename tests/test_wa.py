@@ -494,6 +494,164 @@ class WaTest(unittest.TestCase):
             self.assertEqual(wa.main(["status"]), 4)
 
 
+class SendTest(unittest.TestCase):
+    """wa send: preview, recipient rules, the one-at-a-time gap, read-back and exit 5.
+
+    The Accessibility step is replaced by a stand-in that writes the outgoing row, so the
+    real read-back query runs against the fixture.
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.db = os.path.join(self.tmp.name, "ChatStorage.sqlite")
+        build_db(self.db)
+        self.home = os.path.join(self.tmp.name, "home")
+        self.env = {"WA_DB": self.db, "WA_NOLOG": "1", "HOME": self.home}
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def run_wa(self, *args, env_extra=None):
+        env = dict(os.environ, **self.env)
+        env.update(env_extra or {})
+        for k in [k for k, v in env.items() if v is None]:
+            del env[k]
+        return subprocess.run([sys.executable, WA] + list(args), env=env, capture_output=True,
+                              text=True, cwd=self.tmp.name, timeout=30)
+
+    def in_process(self, argv, wrote=None, gap_stamp=False):
+        """Run wa.main with press_send replaced. wrote=(session pk, text) adds that row."""
+        wa = load_wa()
+        wa.READBACK_WAIT = 1
+        calls = []
+
+        def fake_press(target, text):
+            calls.append((target["phone"], text))
+            if wrote:
+                db = sqlite3.connect(self.db)
+                db.execute("INSERT INTO ZWAMESSAGE (Z_PK, ZCHATSESSION, ZISFROMME, ZMESSAGETYPE, "
+                           "ZMESSAGEDATE, ZTEXT) VALUES (100, ?, 1, 0, ?, ?)",
+                           [wrote[0], ago(0), wrote[1]])
+                db.commit()
+                db.close()
+        if gap_stamp:
+            os.makedirs(os.path.join(self.home, ".wa"), exist_ok=True)
+            open(os.path.join(self.home, ".wa", "last-send"), "w").close()
+        out, err = unittest.mock.MagicMock(), unittest.mock.MagicMock()
+        with unittest.mock.patch.dict(os.environ, self.env), \
+                unittest.mock.patch.object(wa, "press_send", fake_press), \
+                unittest.mock.patch("sys.stdout", out), unittest.mock.patch("sys.stderr", err):
+            code = wa.main(argv)
+        printed = "".join(c.args[0] for c in out.write.call_args_list)
+        errors = "".join(c.args[0] for c in err.write.call_args_list)
+        return code, printed, errors, calls
+
+    def test_preview_sends_nothing_and_prints_the_send_command(self):
+        p = self.run_wa("send", "+66 1111 1111", "--text", "it's $(rm -rf ~)\nline two")
+        self.assertEqual(p.returncode, 0, p.stderr)
+        self.assertIn("To:   +6611111111 (Alice Smith)", p.stdout)
+        self.assertIn("      line two", p.stdout)
+        cmd = p.stderr.split("Not sent. To send it: ", 1)[1].strip()
+        self.assertEqual(shlex.split(cmd), ["wa", "send", "+66 1111 1111", "--text",
+                                            "it's $(rm -rf ~)\nline two", "--yes"])
+        self.assertFalse(os.path.exists(os.path.join(self.home, ".wa", "last-send")))
+
+    def test_preview_json_for_a_new_number_and_a_text_file(self):
+        msg = os.path.join(self.tmp.name, "msg.txt")
+        with open(msg, "w", encoding="utf-8") as f:
+            f.write("Selamat siang, Pak.\nKami mencari importir.\n")
+        p = self.run_wa("send", "+62 852-8382-6458", "--text-file", msg, "--json")
+        self.assertEqual(p.returncode, 0, p.stderr)
+        got = json.loads(p.stdout)
+        self.assertEqual(got, {"phone": "+6285283826458", "jid": "6285283826458@s.whatsapp.net",
+                               "name": None, "new_chat": True, "sent": False, "chars": 42,
+                               "text": "Selamat siang, Pak.\nKami mencari importir."})
+
+    def test_recipient_rules(self):
+        for to, code, said in (("0852 8382 6458", 2, "country code"),
+                               ("+1234", 2, "country code"),
+                               ("Team Lunch", 2, "not a direct chat"),
+                               ("Alice", 2, "chats match"),
+                               ("nobody here", 2, "no chat matches")):
+            p = self.run_wa("send", to, "--text", "hi")
+            self.assertEqual(p.returncode, code, to)
+            self.assertIn(said, p.stderr, to)
+        p = self.run_wa("send", "Alice Wong", "--text", "hi", "--json")
+        self.assertEqual(json.loads(p.stdout)["phone"], "+6622222222")
+        p = self.run_wa("send", "+6611111111", "--text", " \n ")
+        self.assertEqual(p.returncode, 2)
+        self.assertIn("empty", p.stderr)
+
+    def test_send_confirms_by_reading_the_message_back(self):
+        code, out, err, calls = self.in_process(
+            ["send", "Alice Smith", "--text", "Hello  there", "--yes", "--json"],
+            wrote=(1, "Hello there"))
+        self.assertEqual(code, 0, err)
+        got = json.loads(out)
+        self.assertEqual((got["sent"], got["confirmed"], got["id"]), (True, True, 100))
+        self.assertEqual(calls, [("+6611111111", "Hello  there")])
+        self.assertTrue(os.path.exists(os.path.join(self.home, ".wa", "last-send")))
+
+    def test_send_not_in_database_is_exit_5_and_still_counts(self):
+        code, _, err, calls = self.in_process(["send", "+6611111111", "--text", "hi", "--yes"])
+        self.assertEqual(code, 5)
+        self.assertEqual(len(calls), 1)
+        self.assertIn("not in the database", err)
+        self.assertIn("wa read +6611111111", err)
+        self.assertTrue(os.path.exists(os.path.join(self.home, ".wa", "last-send")))
+
+    def test_send_that_lands_in_another_chat_is_exit_5(self):
+        code, _, err, _ = self.in_process(["send", "+6611111111", "--text", "hi", "--yes"],
+                                          wrote=(4, "hi"))
+        self.assertEqual(code, 5)
+        self.assertIn("Alice Wong", err)
+
+    def test_a_second_send_within_the_gap_is_refused(self):
+        code, _, err, calls = self.in_process(["send", "+6611111111", "--text", "hi", "--yes"],
+                                              gap_stamp=True)
+        self.assertEqual((code, calls), (2, []))
+        self.assertIn("one message at a time", err)
+
+    def test_send_off_mac_without_host_or_access_sends_nothing(self):
+        if sys.platform == "darwin":
+            self.skipTest("off-Mac path")
+        p = self.run_wa("send", "+6611111111", "--text", "hi", "--yes")
+        self.assertEqual(p.returncode, 3)
+        self.assertIn("needs WhatsApp for Mac", p.stderr)
+        self.assertFalse(os.path.exists(os.path.join(self.home, ".wa", "last-send")))
+
+    def test_over_ssh_send_reads_the_text_file_here_and_forwards_it(self):
+        bindir = os.path.join(self.tmp.name, "fakebin")
+        os.makedirs(bindir)
+        argv_log = os.path.join(self.tmp.name, "remote-argv")
+        fake = os.path.join(bindir, "ssh")
+        with open(fake, "w") as f:
+            f.write('#!/bin/sh\nwhile [ "$1" != "--" ]; do shift; done\nshift 2\n'
+                    'printf %%s "$1" > "%s"\nexport WA_DB="$FAKE_WA_DB"\nexec sh -c "$1"\n'
+                    % argv_log)
+        os.chmod(fake, 0o755)
+        msg = os.path.join(self.tmp.name, "only-here.txt")
+        with open(msg, "w") as f:
+            f.write("-starts with a dash")
+        env = {"WA_DB": None, "WA_LOCAL": None, "WA_HOST": "my-mac", "FAKE_WA_DB": self.db,
+               "PATH": bindir + os.pathsep + os.environ["PATH"]}
+        p = self.run_wa("send", "--text-file", msg, "+6611111111", env_extra=env)
+        self.assertEqual(p.returncode, 0, p.stderr)
+        self.assertIn("Text: -starts with a dash", p.stdout)
+        self.assertEqual(p.stderr.count("Not sent."), 1)
+        remote = shlex.split(open(argv_log).read())
+        self.assertNotIn(msg, " ".join(remote))
+        self.assertEqual(remote[-4:], ["send", "--text=-starts with a dash", "--", "+6611111111"])
+
+    def test_composer_and_send_button_matching(self):
+        wa = load_wa()
+        for label in ("Send", "send message", "AXSend Send"):
+            self.assertTrue(wa.SEND_WORDS.search(label), label)
+        for label in ("Send voice message", "Send sticker", "Sender info", "Attach"):
+            self.assertFalse(wa.SEND_WORDS.search(label), label)
+        self.assertEqual(wa.norm(" a\n b  c "), "a b c")
+
+
 LAUNCHER_SRC = os.path.join(os.path.dirname(os.path.abspath(WA)), "..", "launcher",
                             "wa-launch.c")
 CLT_PYTHON = "/Library/Developer/CommandLineTools/usr/bin/python3"
