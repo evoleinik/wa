@@ -519,14 +519,19 @@ class SendTest(unittest.TestCase):
         return subprocess.run([sys.executable, WA] + list(args), env=env, capture_output=True,
                               text=True, cwd=self.tmp.name, timeout=30)
 
-    def in_process(self, argv, wrote=None, gap_stamp=False):
-        """Run wa.main with press_send replaced. wrote=(session pk, text) adds that row."""
-        wa = load_wa()
-        wa.READBACK_WAIT = 1
-        calls = []
+    def in_process(self, argv, wrote=None, gap_stamp=False, works="button", empties=True):
+        """Run wa.main with WhatsApp's window replaced by a stand-in.
 
-        def fake_press(target, text):
-            calls.append((target["phone"], text))
+        works names the action that sends: "button", "return", "front" or None.
+        wrote=(session pk, text) is the row WhatsApp writes when it sends. empties=False
+        keeps the text in the composer even after a send. Returns calls: each action taken.
+        """
+        wa = load_wa()
+        wa.READBACK_WAIT, wa.SETTLE_WAIT = 0.3, 0.1
+        calls, state = [], {"held": True, "front": False}
+
+        def write_row():
+            state["held"] = not empties
             if wrote:
                 db = sqlite3.connect(self.db)
                 db.execute("INSERT INTO ZWAMESSAGE (Z_PK, ZCHATSESSION, ZISFROMME, ZMESSAGETYPE, "
@@ -534,12 +539,45 @@ class SendTest(unittest.TestCase):
                            [wrote[0], ago(0), wrote[1]])
                 db.commit()
                 db.close()
+
+        class FakeAX:
+            def press(self, el):
+                calls.append("button")
+                if works == "button":
+                    write_row()
+                return True
+
+            def focus(self, el):
+                return True
+
+            def return_key(self, pid):
+                calls.append("front" if state["front"] else "return")
+                if works == calls[-1]:
+                    write_row()
+
+        def fake_open(target, text):
+            calls.append("open " + target["phone"])
+            return FakeAX(), 1, "composer", "button"
+
+        def fake_find(ax, pid, text):
+            return ("composer" if state["held"] else None), "button", [], None
+
+        real_run = subprocess.run
+
+        def fake_run(cmd, *args, **kw):
+            if cmd[:2] == ["/usr/bin/open", "-b"]:
+                state["front"] = True
+                return subprocess.CompletedProcess(cmd, 0)
+            return real_run(cmd, *args, **kw)
         if gap_stamp:
             os.makedirs(os.path.join(self.home, ".wa"), exist_ok=True)
             open(os.path.join(self.home, ".wa", "last-send"), "w").close()
         out, err = unittest.mock.MagicMock(), unittest.mock.MagicMock()
         with unittest.mock.patch.dict(os.environ, self.env), \
-                unittest.mock.patch.object(wa, "press_send", fake_press), \
+                unittest.mock.patch.object(wa, "open_chat", fake_open), \
+                unittest.mock.patch.object(wa, "find_composer", fake_find), \
+                unittest.mock.patch.object(wa.subprocess, "run", fake_run), \
+                unittest.mock.patch.object(wa.time, "sleep", lambda s: None), \
                 unittest.mock.patch("sys.stdout", out), unittest.mock.patch("sys.stderr", err):
             code = wa.main(argv)
         printed = "".join(c.args[0] for c in out.write.call_args_list)
@@ -589,13 +627,44 @@ class SendTest(unittest.TestCase):
         self.assertEqual(code, 0, err)
         got = json.loads(out)
         self.assertEqual((got["sent"], got["confirmed"], got["id"]), (True, True, 100))
-        self.assertEqual(calls, [("+6611111111", "Hello  there")])
+        self.assertEqual(calls, ["open +6611111111", "button"])
+        self.assertEqual(got["via"], "the Send button")
         self.assertTrue(os.path.exists(os.path.join(self.home, ".wa", "last-send")))
 
+    def test_falls_back_to_return_key_only_while_the_text_waits(self):
+        for works, want in (("return", ["button", "return"]),
+                            ("front", ["button", "return", "front"])):
+            self.tearDown()
+            self.setUp()
+            code, out, err, calls = self.in_process(
+                ["send", "+6611111111", "--text", "hi", "--yes", "--json"],
+                wrote=(1, "hi"), works=works)
+            self.assertEqual(code, 0, err)
+            self.assertEqual(calls[1:], want)
+
+    def test_nothing_works_is_exit_1_with_nothing_sent(self):
+        code, _, err, calls = self.in_process(["send", "+6611111111", "--text", "hi", "--yes"],
+                                              works=None)
+        self.assertEqual(code, 1)
+        self.assertEqual(calls[1:], ["button", "return", "front"])
+        self.assertIn("Nothing was sent", err)
+        self.assertFalse(os.path.exists(os.path.join(self.home, ".wa", "last-send")))
+
+    def test_never_presses_twice_once_the_message_is_in_the_database(self):
+        code, _, err, calls = self.in_process(["send", "+6611111111", "--text", "hi", "--yes"],
+                                              wrote=(1, "hi"), empties=False)
+        self.assertEqual(code, 0, err)
+        self.assertEqual(calls[1:], ["button"])
+
+    def test_check_and_yes_do_not_mix(self):
+        p = self.run_wa("send", "+6611111111", "--text", "hi", "--yes", "--check")
+        self.assertEqual(p.returncode, 2)
+
     def test_send_not_in_database_is_exit_5_and_still_counts(self):
+        # The composer let go of the text, but no row came: one press only, then exit 5.
         code, _, err, calls = self.in_process(["send", "+6611111111", "--text", "hi", "--yes"])
         self.assertEqual(code, 5)
-        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[1:], ["button"])
         self.assertIn("not in the database", err)
         self.assertIn("wa read +6611111111", err)
         self.assertTrue(os.path.exists(os.path.join(self.home, ".wa", "last-send")))

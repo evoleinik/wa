@@ -40,7 +40,7 @@ from datetime import datetime
 
 DEFAULT_DB = os.path.expanduser(
     "~/Library/Group Containers/group.net.whatsapp.WhatsApp.shared/ChatStorage.sqlite")
-VERSION = "2026.11.24.2"
+VERSION = "2026.11.24.3"
 HOST = os.environ.get("WA_HOST")  # SSH host of the Mac; unset means read locally
 # Path of wa-launch on the Mac. wa-launch also sets it for the wa it runs, so hints name it.
 LAUNCHER = os.environ.get("WA_LAUNCHER")
@@ -450,6 +450,7 @@ SEND_GAP = 60  # seconds between two sends, so wa never sends from a loop
 SEND_STAMP = "~/.wa/last-send"  # on the machine that runs wa, never under wa-launch
 UI_WAIT = 15  # seconds to wait for the chat to open
 READBACK_WAIT = 20  # seconds to wait for the sent message to reach the database
+SETTLE_WAIT = 3  # seconds after each press before wa tries the next way
 AX_FIX = ("on the Mac, System Settings > Privacy & Security > Accessibility: add %s"
           % (LAUNCHER or "your terminal app"))
 
@@ -528,7 +529,10 @@ class AX:
                 (ax.AXUIElementCreateApplication, vp, [i32]),
                 (ax.AXUIElementCopyAttributeValue, i32, [vp, vp, ctypes.POINTER(vp)]),
                 (ax.AXUIElementPerformAction, i32, [vp, vp]),
-                (ax.AXUIElementSetMessagingTimeout, i32, [vp, ctypes.c_float])):
+                (ax.AXUIElementSetMessagingTimeout, i32, [vp, ctypes.c_float]),
+                (ax.AXUIElementSetAttributeValue, i32, [vp, vp, vp]),
+                (ax.CGEventCreateKeyboardEvent, vp, [vp, ctypes.c_uint16, ctypes.c_bool]),
+                (ax.CGEventPostToPid, None, [i32, vp])):
             fn.restype, fn.argtypes = res, args
         self.cf, self.ax = cf, ax
         self.str_type, self.arr_type = cf.CFStringGetTypeID(), cf.CFArrayGetTypeID()
@@ -570,6 +574,16 @@ class AX:
 
     def press(self, el):
         return self.ax.AXUIElementPerformAction(el, self.cfstr("AXPress")) == 0
+
+    def focus(self, el):
+        true = self.c.c_void_p.in_dll(self.cf, "kCFBooleanTrue")
+        return self.ax.AXUIElementSetAttributeValue(el, self.cfstr("AXFocused"), true) == 0
+
+    def return_key(self, pid):
+        """Press Return in one app only. The key never reaches the app in front."""
+        for down in (True, False):
+            self.ax.CGEventPostToPid(pid, self.ax.CGEventCreateKeyboardEvent(None, 36, down))
+            time.sleep(0.05)
 
     def walk(self, el, limit=6000):
         """Every element under el, breadth first, each with its parent chain."""
@@ -648,17 +662,29 @@ def find_composer(ax, pid, text):
     return None, None, buttons, refusal
 
 
-def nearest_send(ax, up):
-    """The Send button closest to the composer: search its ancestors, nearest first."""
+def nearest_send(ax, up, seen=None):
+    """The Send button closest to the composer: search its ancestors, nearest first.
+
+    seen, when given, collects the labels of the buttons it passed, for --check.
+    """
     for parent in reversed(up[-6:]):
         for el, _ in ax.walk(parent, limit=400):
-            if ax.get(el, "AXRole") == "AXButton" and SEND_WORDS.search(ax.label(el)):
+            if ax.get(el, "AXRole") != "AXButton":
+                continue
+            label = ax.label(el)
+            if seen is not None and clean(label) not in seen:
+                seen.append(clean(label) or "(no label)")
+            if SEND_WORDS.search(label):
                 return el
     return None
 
 
-def press_send(target, text):
-    """Open the chat with the text, check the composer, press Send. Raises Fail if nothing sent."""
+def open_chat(target, text):
+    """Open the chat with the text in its composer. Returns (ax, pid, composer, button).
+
+    Raises Fail with nothing sent when Accessibility, the screen, the number or the window
+    is not as expected.
+    """
     if sys.platform != "darwin":
         raise Fail(3, "sending needs WhatsApp for Mac", "set WA_HOST to the Mac's SSH host")
     ax = AX()
@@ -684,10 +710,7 @@ def press_send(target, text):
                        "Nothing was sent; the text is waiting in the chat.",
                        "press Send in WhatsApp yourself, or report it at " + ISSUES)
         if button:
-            if not ax.press(button):
-                raise Fail(1, "WhatsApp refused the Send press. Nothing was sent; the text is "
-                           "waiting in the chat.", "press Send in WhatsApp yourself")
-            return
+            return ax, pid, composer, button
         if refusal:
             raise Fail(2, "WhatsApp cannot reach %s. It says: %s. Nothing was sent."
                        % (target["phone"], clean(refusal)), "check the number and its country code")
@@ -696,13 +719,56 @@ def press_send(target, text):
                "open WhatsApp for Mac, check it is signed in, then rerun")
 
 
-def read_back(after_pk, target, text):
+def press_send(target, text, after_pk):
+    """Send the text in the open chat. Returns (how, row) once the composer let go of it.
+
+    Tries the gentlest way first, and checks after each try that the message is not
+    already in the database and the composer still holds the text, so it never sends
+    twice. 1. Press the Send button. 2. Press Return in WhatsApp only. 3. Bring WhatsApp
+    to the front, then press Return in WhatsApp only.
+    """
+    ax, pid, composer, button = open_chat(target, text)
+
+    def settled():
+        row = read_back(after_pk, target, text, wait=SETTLE_WAIT)
+        if row:
+            return row
+        return None if find_composer(ax, pid, text)[0] else "composer empty"
+
+    def via_return(front):
+        if front:
+            subprocess.run(["/usr/bin/open", "-b", "net.whatsapp.WhatsApp"], capture_output=True)
+            time.sleep(0.7)
+        found = find_composer(ax, pid, text)[0]
+        if not found:
+            return False
+        ax.focus(found)
+        time.sleep(0.2)
+        ax.return_key(pid)
+        return True
+
+    tries = (("the Send button", lambda: ax.press(button)),
+             ("the Return key", lambda: via_return(False)),
+             ("the Return key with WhatsApp in front", lambda: via_return(True)))
+    for how, act in tries:
+        if not act():
+            continue
+        got = settled()
+        if got:
+            return how, (got if isinstance(got, dict) else None)
+    raise Fail(1, "WhatsApp did not send on the Send button or the Return key. Nothing was "
+               "sent; the text is waiting in the chat.",
+               "press Send in WhatsApp yourself, or report it at " + ISSUES)
+
+
+def read_back(after_pk, target, text, wait=None):
     """The sent message's row once it is in the database, or None after READBACK_WAIT.
 
     It opens the database again on every try. A connection opened while WhatsApp was quit
     reads a frozen snapshot, and the URL may have just started WhatsApp.
     """
-    want, deadline = norm(text), time.time() + READBACK_WAIT
+    want = norm(text)
+    deadline = time.time() + (READBACK_WAIT if wait is None else wait)
     sql = ("SELECT m.Z_PK, m.ZMESSAGEDATE, s.ZCONTACTJID, s.ZPARTNERNAME, m.ZTEXT "
            "FROM ZWAMESSAGE m JOIN ZWACHATSESSION s ON s.Z_PK = m.ZCHATSESSION "
            "WHERE m.Z_PK > ? AND m.ZISFROMME = 1 ORDER BY m.Z_PK")
@@ -727,17 +793,31 @@ def cmd_send(db, a):
         return out, lambda o: "To:   %s (%s)\nText: %s" % (
             o["phone"], o["name"] or "new chat",
             "\n      ".join(clean(line) for line in o["text"].split("\n")))
+    if a.check:
+        return check_chat(target, text, out)
     after = db.execute("SELECT coalesce(max(Z_PK), 0) FROM ZWAMESSAGE").fetchone()[0]
-    press_send(target, text)
-    got = read_back(after, target, text)
+    how, got = press_send(target, text, after)
+    got = got or read_back(after, target, text)
     if not got or not got["same_chat"]:
         where = "it is not in the database after %ds" % READBACK_WAIT if not got else \
             "it showed up in %s (%s), not %s" % (got["chat"], clean(got["jid"]), target["jid"])
-        raise Fail(5, "WhatsApp took the Send press, but %s." % where,
+        raise Fail(5, "WhatsApp took the message from the composer, but %s." % where,
                    "check the chat yourself: wa read %s -n 3" % shlex.quote(target["phone"]))
     out = dict(out, sent=True, confirmed=True, id=got["id"], time=got["time"],
-               jid=got["jid"], name=got["chat"])
+               jid=got["jid"], name=got["chat"], via=how)
     return out, lambda o: "sent and confirmed: %s %s #%d" % (o["time"], o["phone"], o["id"])
+
+
+def check_chat(target, text, out):
+    """--check: open the chat with the text and find Send, but press nothing."""
+    ax, pid, composer, button = open_chat(target, text)
+    seen = []
+    nearest_send(ax, ancestors(ax, composer), seen)
+    out = dict(out, checked=True, composer=ax.get(composer, "AXRole"),
+               send_button=clean(ax.label(button)), buttons=seen[:30])
+    return out, lambda o: ("Ready: the message waits in the chat with %s. Nothing was sent.\n"
+                           "Send button: %s\nButtons near it: %s" % (
+                               o["phone"], o["send_button"], ", ".join(o["buttons"])))
 
 
 def send_guard(a, as_json):
@@ -746,7 +826,10 @@ def send_guard(a, as_json):
     It reads --text-file here, so a file on this machine works over SSH. With --yes it
     refuses a second send within SEND_GAP seconds, so wa never sends from a loop.
     """
+    if a.check and a.yes:
+        raise Fail(2, "--check and --yes do not go together", "pick one")
     forward = ["send", "--text=" + send_text(a)] + (["--yes"] if a.yes else []) \
+        + (["--check"] if a.check else []) \
         + (["--json"] if as_json else []) + ["--", a.to]
     if not a.yes:
         return None, forward
@@ -891,6 +974,8 @@ def build_parser():
     body.add_argument("--text-file", metavar="FILE", help="read the message from a UTF-8 file")
     w.add_argument("--yes", action="store_true",
                    help="really send it, then confirm it in the database (exit 5 if not)")
+    w.add_argument("--check", action="store_true",
+                   help="open the chat with the text and find Send, but send nothing")
     sub.add_parser("status", parents=[common], help="check access and schema, print counts")
     sub.add_parser("usage", parents=[common], help="30-day stats from this machine's usage log")
     return p
@@ -994,7 +1079,7 @@ def main(argv):
     if a.cmd == "send" and not os.environ.get("WA_LOCAL"):
         if code in (0, 5) and stamp:
             mark_sent(stamp)  # 5 may have sent, so it counts toward the gap too
-        elif code == 0:
+        elif code == 0 and not a.check:
             sys.stdout.flush()
             print("Not sent. To send it: " + shlex.join(["wa"] + argv + ["--yes"]), file=sys.stderr)
     log_usage(a.cmd, code, int((time.time() - start) * 1000), not local)
