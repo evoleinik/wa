@@ -643,6 +643,15 @@ class SendTest(unittest.TestCase):
         self.assertNotIn(msg, " ".join(remote))
         self.assertEqual(remote[-4:], ["send", "--text=-starts with a dash", "--", "+6611111111"])
 
+    def test_launched_send_refuses_text_file(self):
+        secret = os.path.join(self.tmp.name, "secret.txt")
+        with open(secret, "w") as f:
+            f.write("private")
+        p = self.run_wa("send", "+6611111111", "--text-file", secret,
+                        env_extra={"WA_LAUNCHED": "1", "WA_LOCAL": "1"})
+        self.assertEqual(p.returncode, 2)
+        self.assertNotIn("private", p.stdout + p.stderr)
+
     def test_composer_and_send_button_matching(self):
         wa = load_wa()
         for label in ("Send", "send message", "AXSend Send"):

@@ -40,7 +40,7 @@ from datetime import datetime
 
 DEFAULT_DB = os.path.expanduser(
     "~/Library/Group Containers/group.net.whatsapp.WhatsApp.shared/ChatStorage.sqlite")
-VERSION = "2026.11.24.1"
+VERSION = "2026.11.24.2"
 HOST = os.environ.get("WA_HOST")  # SSH host of the Mac; unset means read locally
 # Path of wa-launch on the Mac. wa-launch also sets it for the wa it runs, so hints name it.
 LAUNCHER = os.environ.get("WA_LAUNCHER")
@@ -431,9 +431,14 @@ def cmd_status(db, a):
         + CHAT_FILTER + "), (SELECT max(ZMESSAGEDATE) FROM ZWAMESSAGE)").fetchone()
     path = os.environ.get("WA_DB", DEFAULT_DB)
     out = {"db": path, "size_mb": round(os.path.getsize(path) / 1e6, 1), "messages": msgs,
-           "chats": chats, "latest": iso_time(last) if last else None, "schema_ok": True}
-    return out, lambda o: "ok: %s messages, %s chats, latest %s, %s MB" % (
-        o["messages"], o["chats"], o["latest"], o["size_mb"])
+           "chats": chats, "latest": iso_time(last) if last else None, "schema_ok": True,
+           "send_ready": sys.platform == "darwin" and AX().trusted()}
+    if not out["send_ready"]:
+        print("wa: send is off: macOS has not given wa Accessibility.", file=sys.stderr)
+        print("Try: " + AX_FIX, file=sys.stderr)
+    return out, lambda o: "ok: %s messages, %s chats, latest %s, %s MB, send %s" % (
+        o["messages"], o["chats"], o["latest"], o["size_mb"],
+        "ready" if o["send_ready"] else "off")
 
 
 # --- send -----------------------------------------------------------------------------
@@ -475,12 +480,16 @@ def send_target(db, to):
                 "new_chat": row is None}
     _, name, jid = resolve_chat(db, to)
     if not (jid or "").endswith("@s.whatsapp.net"):
-        raise Fail(2, "%s (%s) is not a direct chat with a phone number" % (clean(name), jid),
+        raise Fail(2, "%s (%s) is not a direct chat with a phone number" % (clean(name), clean(jid)),
                    "wa send sends to one person: pass their number, like +62 852 8382 6458")
     return {"phone": "+" + user_part(jid), "jid": jid, "name": clean(name), "new_chat": False}
 
 
 def send_text(a):
+    if a.text_file is not None and LAUNCHED:
+        # The granted process could read any file and print it in the preview.
+        raise Fail(2, "under wa-launch, wa send takes --text only",
+                   "run wa send on the machine you read from; it reads the file there")
     if a.text_file is not None:
         try:
             with open(a.text_file, encoding="utf-8") as f:
@@ -630,7 +639,7 @@ def find_composer(ax, pid, text):
         for el, up in ax.walk(win):
             role = ax.get(el, "AXRole")
             if role == "AXButton":
-                buttons.append(ax.label(el) or "(no label)")
+                buttons.append(clean(ax.label(el)) or "(no label)")
             elif role == "AXStaticText" and not refusal:
                 line = ax.get(el, "AXValue") or ""
                 refusal = line[:120] if isinstance(line, str) and REFUSED.search(line) else None
@@ -723,7 +732,7 @@ def cmd_send(db, a):
     got = read_back(after, target, text)
     if not got or not got["same_chat"]:
         where = "it is not in the database after %ds" % READBACK_WAIT if not got else \
-            "it showed up in %s (%s), not %s" % (got["chat"], got["jid"], target["jid"])
+            "it showed up in %s (%s), not %s" % (got["chat"], clean(got["jid"]), target["jid"])
         raise Fail(5, "WhatsApp took the Send press, but %s." % where,
                    "check the chat yourself: wa read %s -n 3" % shlex.quote(target["phone"]))
     out = dict(out, sent=True, confirmed=True, id=got["id"], time=got["time"],
