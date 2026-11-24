@@ -1,7 +1,7 @@
 {
   "name": "wa",
   "version": "2026.10.31.2",
-  "description": "Read-only WhatsApp for Claude: the wa CLI and a skill over the WhatsApp for Mac database. No linked device, no QR code.",
+  "description": "WhatsApp for Claude: the wa CLI and a skill over the WhatsApp for Mac database. Reads chats and sends one approved message through the Mac app. No linked device, no QR code.",
   "author": {
     "name": "Evgeny Oleynik",
     "url": "https://github.com/evoleinik"
@@ -12,7 +12,7 @@
   "keywords": [
     "whatsapp",
     "macos",
-    "read-only",
+    "whatsapp-for-mac",
     "cli",
     "messages"
   ]

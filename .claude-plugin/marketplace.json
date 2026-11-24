@@ -1,6 +1,6 @@
 {
   "name": "evoleinik-wa",
-  "description": "wa: read-only WhatsApp CLI and skill for Claude Code",
+  "description": "wa: WhatsApp CLI and skill for Claude Code",
   "owner": {
     "name": "Evgeny Oleynik",
     "url": "https://github.com/evoleinik"
@@ -9,9 +9,9 @@
     {
       "name": "wa",
       "source": "./",
-      "description": "Read your WhatsApp chats from Claude, read-only, from the WhatsApp for Mac database.",
+      "description": "Read your WhatsApp chats from Claude, and send one approved message, through the WhatsApp for Mac database and app.",
       "category": "productivity",
-      "tags": ["whatsapp", "macos", "messages", "read-only"]
+      "tags": ["whatsapp", "macos", "messages", "whatsapp-for-mac"]
     }
   ]
 }
