@@ -40,7 +40,7 @@ from datetime import datetime
 
 DEFAULT_DB = os.path.expanduser(
     "~/Library/Group Containers/group.net.whatsapp.WhatsApp.shared/ChatStorage.sqlite")
-VERSION = "2026.11.24.3"
+VERSION = "2026.11.24.4"
 HOST = os.environ.get("WA_HOST")  # SSH host of the Mac; unset means read locally
 # Path of wa-launch on the Mac. wa-launch also sets it for the wa it runs, so hints name it.
 LAUNCHER = os.environ.get("WA_LAUNCHER")
@@ -724,7 +724,7 @@ def press_send(target, text, after_pk):
 
     Tries the gentlest way first, and checks after each try that the message is not
     already in the database and the composer still holds the text, so it never sends
-    twice. 1. Press the Send button. 2. Press Return in WhatsApp only. 3. Bring WhatsApp
+    twice. 1. Press Return in WhatsApp only. 2. Press the Send button. 3. Bring WhatsApp
     to the front, then press Return in WhatsApp only.
     """
     ax, pid, composer, button = open_chat(target, text)
@@ -747,8 +747,10 @@ def press_send(target, text, after_pk):
         ax.return_key(pid)
         return True
 
-    tries = (("the Send button", lambda: ax.press(button)),
-             ("the Return key", lambda: via_return(False)),
+    # Return first: on WhatsApp 26.47 AXPress on the Send button returned ok and sent
+    # nothing, while Return sent (2026-11-24).
+    tries = (("the Return key", lambda: via_return(False)),
+             ("the Send button", lambda: ax.press(button)),
              ("the Return key with WhatsApp in front", lambda: via_return(True)))
     for how, act in tries:
         if not act():
@@ -789,12 +791,12 @@ def cmd_send(db, a):
     text = send_text(a)
     target = send_target(db, a.to)
     out = dict(target, text=text, chars=len(text), sent=False)
+    if a.check:
+        return check_chat(target, text, out)
     if not a.yes:
         return out, lambda o: "To:   %s (%s)\nText: %s" % (
             o["phone"], o["name"] or "new chat",
             "\n      ".join(clean(line) for line in o["text"].split("\n")))
-    if a.check:
-        return check_chat(target, text, out)
     after = db.execute("SELECT coalesce(max(Z_PK), 0) FROM ZWAMESSAGE").fetchone()[0]
     how, got = press_send(target, text, after)
     got = got or read_back(after, target, text)

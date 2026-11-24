@@ -194,13 +194,24 @@ wa send 'Alice Smith' --text 'On my way' --yes     # a direct chat you already h
 - Without `--yes` it sends nothing. It prints the recipient and text, and the command to
   send them on stderr.
 - With `--yes` it opens `whatsapp://send?phone=...&text=...` in the background. It finds the
-  composer that holds exactly your text and presses the Send button next to it through
-  Accessibility. It never types keys, so nothing lands in the app you are using. Then it
-  waits for the message to appear in the database and prints its id.
+  composer that holds exactly your text and presses Return in WhatsApp only, through
+  Accessibility. The key never goes to the app you are using. If the text is still
+  there, it tries the Send button, then Return with WhatsApp in front. It stops as soon
+  as the message is in the database or the composer is empty, so it never sends twice.
+  Then it waits for the message to appear in the database and prints its id:
+
+  ```
+  $ wa send +66809972366 --text-file test.txt --yes
+  sent and confirmed: 2026-11-24T21:04:55+07:00 +66809972366 #161580
+  ```
+- `--check` opens the chat with the text and names the Send button it found, but sends
+  nothing. Use it after a WhatsApp update.
 - It refuses a second `--yes` within 60 seconds of the last one, so it cannot send from a
   loop. The stamp is `~/.wa/last-send` on the machine you typed `wa send` on.
-- It stops with nothing sent when the screen is locked, the number is not on WhatsApp,
-  the composer does not hold your exact text, or there is no Send button.
+- It stops with nothing sent, exit 1, 2 or 3, when the screen is locked, the number is not
+  on WhatsApp, the composer does not hold your exact text, or no press empties it.
+- Your own number opens the "Message yourself" chat. WhatsApp files it, and some new
+  chats, under an internal `@lid` id instead of the number. Read-back accepts that.
 - `--text-file` is read on the machine you run `wa` on, also over SSH.
 
 Sending needs Accessibility. On the Mac, add your terminal app, or `wa-launch` when you

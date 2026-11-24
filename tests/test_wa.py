@@ -519,7 +519,7 @@ class SendTest(unittest.TestCase):
         return subprocess.run([sys.executable, WA] + list(args), env=env, capture_output=True,
                               text=True, cwd=self.tmp.name, timeout=30)
 
-    def in_process(self, argv, wrote=None, gap_stamp=False, works="button", empties=True):
+    def in_process(self, argv, wrote=None, gap_stamp=False, works="return", empties=True):
         """Run wa.main with WhatsApp's window replaced by a stand-in.
 
         works names the action that sends: "button", "return", "front" or None.
@@ -627,13 +627,13 @@ class SendTest(unittest.TestCase):
         self.assertEqual(code, 0, err)
         got = json.loads(out)
         self.assertEqual((got["sent"], got["confirmed"], got["id"]), (True, True, 100))
-        self.assertEqual(calls, ["open +6611111111", "button"])
-        self.assertEqual(got["via"], "the Send button")
+        self.assertEqual(calls, ["open +6611111111", "return"])
+        self.assertEqual(got["via"], "the Return key")
         self.assertTrue(os.path.exists(os.path.join(self.home, ".wa", "last-send")))
 
     def test_falls_back_to_return_key_only_while_the_text_waits(self):
-        for works, want in (("return", ["button", "return"]),
-                            ("front", ["button", "return", "front"])):
+        for works, want in (("button", ["return", "button"]),
+                            ("front", ["return", "button", "front"])):
             self.tearDown()
             self.setUp()
             code, out, err, calls = self.in_process(
@@ -646,7 +646,7 @@ class SendTest(unittest.TestCase):
         code, _, err, calls = self.in_process(["send", "+6611111111", "--text", "hi", "--yes"],
                                               works=None)
         self.assertEqual(code, 1)
-        self.assertEqual(calls[1:], ["button", "return", "front"])
+        self.assertEqual(calls[1:], ["return", "button", "front"])
         self.assertIn("Nothing was sent", err)
         self.assertFalse(os.path.exists(os.path.join(self.home, ".wa", "last-send")))
 
@@ -654,7 +654,18 @@ class SendTest(unittest.TestCase):
         code, _, err, calls = self.in_process(["send", "+6611111111", "--text", "hi", "--yes"],
                                               wrote=(1, "hi"), empties=False)
         self.assertEqual(code, 0, err)
-        self.assertEqual(calls[1:], ["button"])
+        self.assertEqual(calls[1:], ["return"])
+
+    def test_check_opens_the_chat_and_presses_nothing(self):
+        wa = load_wa()
+        with unittest.mock.patch.object(wa, "check_chat",
+                                        lambda t, text, out: (dict(out, checked=True), str)), \
+                unittest.mock.patch.object(wa, "press_send", lambda *x: self.fail("pressed")), \
+                unittest.mock.patch.dict(os.environ, self.env), \
+                unittest.mock.patch("sys.stdout") as out, unittest.mock.patch("sys.stderr"):
+            code = wa.main(["send", "+6611111111", "--text", "hi", "--check", "--json"])
+        self.assertEqual(code, 0)
+        self.assertTrue(json.loads(out.write.call_args_list[0].args[0])["checked"])
 
     def test_check_and_yes_do_not_mix(self):
         p = self.run_wa("send", "+6611111111", "--text", "hi", "--yes", "--check")
@@ -664,7 +675,7 @@ class SendTest(unittest.TestCase):
         # The composer let go of the text, but no row came: one press only, then exit 5.
         code, _, err, calls = self.in_process(["send", "+6611111111", "--text", "hi", "--yes"])
         self.assertEqual(code, 5)
-        self.assertEqual(calls[1:], ["button"])
+        self.assertEqual(calls[1:], ["return"])
         self.assertIn("not in the database", err)
         self.assertIn("wa read +6611111111", err)
         self.assertTrue(os.path.exists(os.path.join(self.home, ".wa", "last-send")))
