@@ -646,7 +646,16 @@ class SendTest(unittest.TestCase):
         db.close()
         p = self.run_wa("send", "120363000001@g.us", "--text", "hi")
         self.assertEqual(p.returncode, 2)
-        self.assertIn("2 chats are named", p.stderr)
+        self.assertIn("2 chats or people are named", p.stderr)
+        self.tearDown()
+        self.setUp()
+        db = sqlite3.connect(self.db)
+        db.execute("INSERT INTO ZWAPROFILEPUSHNAME (ZJID, ZPUSHNAME) VALUES ('6677@s.whatsapp.net', "
+                   "'Team Lunch')")
+        db.commit()
+        db.close()
+        p = self.run_wa("send", "120363000001@g.us", "--text", "hi")
+        self.assertEqual(p.returncode, 2, p.stderr)
 
     def test_group_without_member_columns_is_exit_1(self):
         build_db(self.db + "2", drop="ZWAGROUPMEMBER.ZISACTIVE")
@@ -702,6 +711,12 @@ class SendTest(unittest.TestCase):
         composer, search = window("Team Lunch")
         self.assertTrue(wa.chat_titled(Tree(), composer, "team  lunch", search))
         composer, search = window("Alice Smith")
+        self.assertFalse(wa.chat_titled(Tree(), composer, "Team Lunch", search))
+        # A message that reads "Team Lunch" in Alice's chat is not a title.
+        composer, search = window("Alice Smith")
+        pane = composer.parent.parent
+        pane.kids.append(Node("AXScrollArea", kids=[Node("AXStaticText", "Team Lunch")]))
+        pane.kids[-1].parent = pane
         self.assertFalse(wa.chat_titled(Tree(), composer, "Team Lunch", search))
 
     def test_send_confirms_by_reading_the_message_back(self):

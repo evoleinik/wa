@@ -500,11 +500,16 @@ def group_target(db, to, pk, name, jid):
     if to != jid and to.casefold() != (name or "").casefold():
         raise Fail(2, "%r only matches part of the group name %r" % (to, clean(name)),
                    "pass the group's exact name or its JID: wa send %s ..." % shlex.quote(jid))
-    same = db.execute("SELECT s.ZCONTACTJID FROM ZWACHATSESSION s WHERE " + CHAT_FILTER
-                      + " AND lower(s.ZPARTNERNAME) = lower(?)", [name or ""]).fetchall()
-    if not name or len(same) > 1:
-        raise Fail(2, "%d chats are named %r, so wa cannot pick the group in WhatsApp's "
-                   "search. Nothing was sent." % (len(same), clean(name)),
+    # WhatsApp's search also lists hidden chats and people by their push name, so count
+    # those too. Contacts in the address book are not in this database: read-back is the
+    # check for them.
+    same = db.execute("SELECT count(*) FROM ZWACHATSESSION WHERE lower(ZPARTNERNAME) = lower(?)",
+                      [name or ""]).fetchone()[0] + db.execute(
+        "SELECT count(*) FROM ZWAPROFILEPUSHNAME WHERE lower(ZPUSHNAME) = lower(?)",
+        [name or ""]).fetchone()[0]
+    if not name or same > 1:
+        raise Fail(2, "%d chats or people are named %r, so wa cannot pick the group in "
+                   "WhatsApp's search. Nothing was sent." % (same, clean(name)),
                    "rename the group in WhatsApp so its name is unique, then rerun")
     cols = {r[1] for r in db.execute("PRAGMA table_info(ZWAGROUPMEMBER)")}
     missing = [c for c in ("ZCHATSESSION", "ZISACTIVE") if c not in cols]
@@ -835,20 +840,29 @@ def chat_titled(ax, composer, name, search):
 
     It looks for a label that reads exactly name in the nearest ancestor of the composer,
     and stops at the first ancestor that also holds the chat list's search field, because
-    the chat list shows the name too.
+    the chat list shows the name too. It skips lists and scroll areas, where the messages
+    are, so a message that reads like the name does not count as the title.
     """
     want = norm(name).casefold()
     for parent in reversed(ancestors(ax, composer)[-8:]):
-        hit = False
-        for el, _ in ax.walk(parent, limit=2000):
+        hit, queue, seen = False, [parent], 0
+        while queue and seen < 2000:
+            el = queue.pop(0)
+            seen += 1
             if ax.same(el, search):
                 return False
-            if ax.get(el, "AXRole") in ("AXStaticText", "AXButton", "AXHeading") \
-                    and has_text(ax, el, want):
+            role = ax.get(el, "AXRole")
+            if role in MESSAGE_AREAS:
+                continue
+            if role in ("AXStaticText", "AXButton", "AXHeading") and has_text(ax, el, want):
                 hit = True
+            queue.extend(ax.get(el, "AXChildren") or [])
         if hit:
             return True
     return False
+
+
+MESSAGE_AREAS = ("AXList", "AXTable", "AXOutline", "AXScrollArea", "AXCollection")
 
 
 def open_composer(ax, app, search):

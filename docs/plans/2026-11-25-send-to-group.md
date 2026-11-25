@@ -68,3 +68,14 @@ presses anything. The clipboard cost is small, and wa restores the text it held.
 
 1. (Side effects) Is it fine that wa borrows the clipboard for about a second during a
    group send? Default: yes, it puts back the text that was there.
+   A clipboard manager on air would record the group name and the message text. pbcopy
+   cannot mark them as transient.
+
+## Review notes (2026-11-25, automated security review)
+
+- The title check could match a message that reads like the group name. Fixed: it now
+  skips lists and scroll areas, where messages live.
+- The unique-name check counted only visible chats. Fixed: it counts hidden chats and
+  push names too. Address-book contacts are not in this database. A contact named like
+  the group would show up in search, so read-back (exit 5) is the only check there.
+- Clipboard exposure is accepted for now, as question 1 asks.
