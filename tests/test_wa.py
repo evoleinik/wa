@@ -50,15 +50,20 @@ def write_media(folder):
             f.write(data)
 
 
+# Columns only wa send to a group reads, checked when it does.
+GROUP_COLUMNS = {"ZWAGROUPMEMBER": ["ZCHATSESSION", "ZISACTIVE"]}
+
+
 def build_db(path, drop=None):
     """Fixture DB with the columns wa reads. drop='TABLE.COL' leaves one out."""
     wa = load_wa()
     db = sqlite3.connect(path)
-    for table, cols in wa.REQUIRED.items():
+    tables = {t: c + GROUP_COLUMNS.get(t, []) for t, c in wa.REQUIRED.items()}
+    for table, cols in tables.items():
         cols = [c for c in cols if "%s.%s" % (table, c) != drop]
         db.execute("CREATE TABLE %s (%s)" % (table, ", ".join(
             c + (" INTEGER PRIMARY KEY" if c == "Z_PK" else "") for c in cols)))
-    have = lambda t: [c for c in wa.REQUIRED[t] if "%s.%s" % (t, c) != drop]
+    have = lambda t: [c for c in tables[t] if "%s.%s" % (t, c) != drop]
 
     def ins(table, **row):
         row = {k: v for k, v in row.items() if k in have(table)}
@@ -78,8 +83,10 @@ def build_db(path, drop=None):
         ins("ZWACHATSESSION", Z_PK=pk, ZPARTNERNAME=name, ZCONTACTJID=jid, ZSESSIONTYPE=stype,
             ZLASTMESSAGEDATE=last, ZUNREADCOUNT=unread, ZLASTMESSAGE=lm, ZARCHIVED=0,
             ZHIDDEN=1 if name == "Secret" else 0, ZREMOVED=0)
-    ins("ZWAGROUPMEMBER", Z_PK=1, ZMEMBERJID="6644@s.whatsapp.net", ZCONTACTNAME="Carol")
-    ins("ZWAGROUPMEMBER", Z_PK=2, ZMEMBERJID="6655@s.whatsapp.net")
+    ins("ZWAGROUPMEMBER", Z_PK=1, ZMEMBERJID="6644@s.whatsapp.net", ZCONTACTNAME="Carol",
+        ZCHATSESSION=2, ZISACTIVE=1)
+    ins("ZWAGROUPMEMBER", Z_PK=2, ZMEMBERJID="6655@s.whatsapp.net", ZCHATSESSION=2, ZISACTIVE=1)
+    ins("ZWAGROUPMEMBER", Z_PK=3, ZMEMBERJID="6666@s.whatsapp.net", ZCHATSESSION=2, ZISACTIVE=0)
     ins("ZWAPROFILEPUSHNAME", ZJID="6655@s.whatsapp.net", ZPUSHNAME="Dave P")
     ins("ZWAMEDIAITEM", Z_PK=1, ZTITLE="receipt photo", ZMEDIALOCALPATH=IMG,
         ZXMPPTHUMBPATH=THUMB)
@@ -556,7 +563,7 @@ class SendTest(unittest.TestCase):
                     write_row()
 
         def fake_open(target, text):
-            calls.append("open " + target["phone"])
+            calls.append("open " + (target["phone"] or target["jid"]))
             return FakeAX(), 1, "composer", "button"
 
         def fake_find(ax, pid, text):
@@ -602,13 +609,15 @@ class SendTest(unittest.TestCase):
         self.assertEqual(p.returncode, 0, p.stderr)
         got = json.loads(p.stdout)
         self.assertEqual(got, {"phone": "+6285283826458", "jid": "6285283826458@s.whatsapp.net",
-                               "name": None, "new_chat": True, "sent": False, "chars": 42,
+                               "name": None, "new_chat": True, "group": False, "sent": False,
+                               "chars": 42,
                                "text": "Selamat siang, Pak.\nKami mencari importir."})
 
     def test_recipient_rules(self):
         for to, code, said in (("0852 8382 6458", 2, "country code"),
                                ("+1234", 2, "country code"),
-                               ("Team Lunch", 2, "not a direct chat"),
+                               ("Team", 2, "exact name"),
+                               ("status@broadcast", 2, "no chat matches"),
                                ("Alice", 2, "chats match"),
                                ("nobody here", 2, "no chat matches")):
             p = self.run_wa("send", to, "--text", "hi")
@@ -619,6 +628,81 @@ class SendTest(unittest.TestCase):
         p = self.run_wa("send", "+6611111111", "--text", " \n ")
         self.assertEqual(p.returncode, 2)
         self.assertIn("empty", p.stderr)
+
+    def test_group_preview_names_the_group_and_its_members(self):
+        for to in ("120363000001@g.us", "team lunch"):
+            p = self.run_wa("send", to, "--text", "hi all")
+            self.assertEqual(p.returncode, 0, p.stderr)
+            self.assertIn("To:   Team Lunch (group, 2 members, 120363000001@g.us)", p.stdout)
+            self.assertIn("Not sent. To send it: wa send", p.stderr)
+        got = json.loads(self.run_wa("send", "Team Lunch", "--text", "x", "--json").stdout)
+        self.assertEqual((got["group"], got["members"], got["phone"]), (True, 2, None))
+
+    def test_group_whose_name_is_not_unique_is_refused(self):
+        db = sqlite3.connect(self.db)
+        db.execute("INSERT INTO ZWACHATSESSION (Z_PK, ZPARTNERNAME, ZCONTACTJID, ZSESSIONTYPE, "
+                   "ZHIDDEN, ZREMOVED) VALUES (9, 'TEAM LUNCH', '120363000009@g.us', 1, 0, 0)")
+        db.commit()
+        db.close()
+        p = self.run_wa("send", "120363000001@g.us", "--text", "hi")
+        self.assertEqual(p.returncode, 2)
+        self.assertIn("2 chats are named", p.stderr)
+
+    def test_group_without_member_columns_is_exit_1(self):
+        build_db(self.db + "2", drop="ZWAGROUPMEMBER.ZISACTIVE")
+        p = self.run_wa("send", "Team Lunch", "--text", "hi", env_extra={"WA_DB": self.db + "2"})
+        self.assertEqual(p.returncode, 1)
+        self.assertIn("ZISACTIVE", p.stderr)
+
+    def test_group_send_confirms_in_the_group_only(self):
+        code, out, err, calls = self.in_process(
+            ["send", "Team Lunch", "--text", "hi all", "--yes", "--json"], wrote=(2, "hi all"))
+        self.assertEqual(code, 0, err)
+        self.assertEqual(calls, ["open 120363000001@g.us", "return"])
+        self.assertTrue(json.loads(out)["confirmed"])
+        self.tearDown()
+        self.setUp()
+        db = sqlite3.connect(self.db)  # a person's @lid chat passes for a person, never a group
+        db.execute("INSERT INTO ZWACHATSESSION (Z_PK, ZPARTNERNAME, ZCONTACTJID, ZSESSIONTYPE, "
+                   "ZHIDDEN, ZREMOVED) VALUES (9, 'Someone', '1234@lid', 0, 0, 0)")
+        db.commit()
+        db.close()
+        code, _, err, _ = self.in_process(["send", "Team Lunch", "--text", "hi", "--yes"],
+                                          wrote=(9, "hi"))
+        self.assertEqual(code, 5)
+        self.assertIn("wa read 120363000001@g.us", err)
+
+    def test_group_chat_title_check_ignores_the_chat_list(self):
+        wa = load_wa()
+
+        class Node:
+            def __init__(self, role, text=None, kids=()):
+                self.role, self.text, self.kids, self.parent = role, text, list(kids), None
+                for k in self.kids:
+                    k.parent = self
+
+        class Tree:
+            def get(self, el, attr):
+                return {"AXRole": el.role, "AXValue": el.text, "AXChildren": el.kids,
+                        "AXParent": el.parent}.get(attr)
+
+            def same(self, a, b):
+                return a is b
+
+            walk = wa.AX.walk
+
+        def window(header):
+            search = Node("AXTextField", "Team Lunch")
+            composer = Node("AXTextArea", "")
+            Node("AXWindow", kids=[
+                Node("AXGroup", kids=[search, Node("AXStaticText", "Team Lunch")]),
+                Node("AXGroup", kids=[Node("AXGroup", kids=[Node("AXStaticText", header)]),
+                                      Node("AXGroup", kids=[composer])])])
+            return composer, search
+        composer, search = window("Team Lunch")
+        self.assertTrue(wa.chat_titled(Tree(), composer, "team  lunch", search))
+        composer, search = window("Alice Smith")
+        self.assertFalse(wa.chat_titled(Tree(), composer, "Team Lunch", search))
 
     def test_send_confirms_by_reading_the_message_back(self):
         code, out, err, calls = self.in_process(

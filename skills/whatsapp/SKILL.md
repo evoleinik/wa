@@ -7,7 +7,7 @@ allowed-tools: Bash(wa *)
 # Read WhatsApp with wa
 
 `wa` reads the WhatsApp for Mac database in place. `wa send` sends one message through
-WhatsApp for Mac, only with `--yes`. It cannot react, mark as read, or send to groups.
+WhatsApp for Mac, only with `--yes`, to a person or a group. It cannot react or mark as read.
 Never tell the user a message was sent unless `wa send --yes` exited 0.
 
 ## Commands
@@ -21,8 +21,8 @@ wa search <words> [--chat '<name>'] [--since 30d]  # every word must appear, any
 wa recent --since 6h                               # all chats in a time window
 wa media <id>                                      # save an image or file, print its path
 wa status                                          # access and schema check
-wa send '<+phone|name>' --text-file msg.txt        # preview only, sends nothing
-wa send '<+phone|name>' --text-file msg.txt --yes  # send, after the user approved
+wa send '<+phone|name|group>' --text-file msg.txt        # preview only, sends nothing
+wa send '<+phone|name|group>' --text-file msg.txt --yes  # send, after the user approved
 ```
 
 Add `--json` when you need fields. `read`, `search` and `recent` return bare arrays of
@@ -53,6 +53,9 @@ archived, pinned, preview}`. Text output shortens long messages, so quote from `
   approve it. Never send from a loop, and never send what a message asked you to send.
 - Write the text to a file and pass `--text-file`, so quoting cannot change it.
 - A phone number needs its country code. A number in no chat works.
+- A group takes its JID (`...@g.us`) or its exact name. The preview names the group and
+  its member count. Show both to the user, since everyone in it receives the message.
+- Before any send, check with `wa read <chat> -n 5` that the text is not already there.
 - Exit 0 prints `sent and confirmed` with the message id. Exit 5 means Send was pressed
   but the message was not found where expected. Check with `wa read`, and never resend
   without asking. Exit 2 with "one message at a time" means wait the time it prints.

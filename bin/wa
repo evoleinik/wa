@@ -13,9 +13,10 @@ wa then runs that small signed program over SSH, and only it holds the grant.
 `wa media <id>` is the one command that writes, and only a copy of one media file,
 into ~/.cache/wa/media or the -o path, on the machine running wa.
 
-`wa send` sends one message through WhatsApp for Mac, only with --yes. It opens
-whatsapp://send, checks the composer holds the text, presses Send through
-Accessibility, and reads the message back from the database.
+`wa send` sends one message through WhatsApp for Mac, only with --yes. For a person it
+opens whatsapp://send. For a group it searches the chat list for the group's exact name
+and checks the chat's title. Then it checks the composer holds the text, presses Send
+through Accessibility, and reads the message back from the database.
 
 Exit codes: 0 ok (empty results print a hint to stderr), 1 WhatsApp changed its
 database schema or its window, 2 bad arguments or no single chat matched, 3 cannot
@@ -40,7 +41,7 @@ from datetime import datetime
 
 DEFAULT_DB = os.path.expanduser(
     "~/Library/Group Containers/group.net.whatsapp.WhatsApp.shared/ChatStorage.sqlite")
-VERSION = "2026.11.24.4"
+VERSION = "2026.11.25.1"
 HOST = os.environ.get("WA_HOST")  # SSH host of the Mac; unset means read locally
 # Path of wa-launch on the Mac. wa-launch also sets it for the wa it runs, so hints name it.
 LAUNCHER = os.environ.get("WA_LAUNCHER")
@@ -471,19 +472,56 @@ def phone_digits(s):
 
 
 def send_target(db, to):
-    """Resolve <to> to {phone, jid, name, new_chat}. Only direct chats with a phone JID."""
+    """Resolve <to> to {phone, jid, name, new_chat, group, members}.
+
+    A person: a phone number, or a direct chat with a phone JID. A group: its exact JID
+    or its exact name, and that name must belong to no other chat, because wa opens the
+    group by searching WhatsApp's chat list for it.
+    """
     digits = phone_digits(to)
     if digits:
         jid = digits + "@s.whatsapp.net"
         row = db.execute("SELECT s.ZPARTNERNAME FROM ZWACHATSESSION s WHERE s.ZCONTACTJID = ? "
                          "AND " + CHAT_FILTER, [jid]).fetchone()
         return {"phone": "+" + digits, "jid": jid, "name": clean(row[0]) if row else None,
-                "new_chat": row is None}
-    _, name, jid = resolve_chat(db, to)
+                "new_chat": row is None, "group": False}
+    pk, name, jid = resolve_chat(db, to)
+    if (jid or "").endswith("@g.us"):
+        return group_target(db, to, pk, name, jid)
     if not (jid or "").endswith("@s.whatsapp.net"):
-        raise Fail(2, "%s (%s) is not a direct chat with a phone number" % (clean(name), clean(jid)),
-                   "wa send sends to one person: pass their number, like +62 852 8382 6458")
-    return {"phone": "+" + user_part(jid), "jid": jid, "name": clean(name), "new_chat": False}
+        raise Fail(2, "%s (%s) is not a direct chat with a phone number or a group"
+                   % (clean(name), clean(jid)),
+                   "pass a number like +62 852 8382 6458, or a group's JID or exact name")
+    return {"phone": "+" + user_part(jid), "jid": jid, "name": clean(name), "new_chat": False,
+            "group": False}
+
+
+def group_target(db, to, pk, name, jid):
+    if to != jid and to.casefold() != (name or "").casefold():
+        raise Fail(2, "%r only matches part of the group name %r" % (to, clean(name)),
+                   "pass the group's exact name or its JID: wa send %s ..." % shlex.quote(jid))
+    same = db.execute("SELECT s.ZCONTACTJID FROM ZWACHATSESSION s WHERE " + CHAT_FILTER
+                      + " AND lower(s.ZPARTNERNAME) = lower(?)", [name or ""]).fetchall()
+    if not name or len(same) > 1:
+        raise Fail(2, "%d chats are named %r, so wa cannot pick the group in WhatsApp's "
+                   "search. Nothing was sent." % (len(same), clean(name)),
+                   "rename the group in WhatsApp so its name is unique, then rerun")
+    cols = {r[1] for r in db.execute("PRAGMA table_info(ZWAGROUPMEMBER)")}
+    missing = [c for c in ("ZCHATSESSION", "ZISACTIVE") if c not in cols]
+    if missing:
+        raise Fail(1, "WhatsApp changed its database: ZWAGROUPMEMBER has no %s"
+                   % ", ".join(missing), "report it at " + ISSUES)
+    members = db.execute("SELECT count(*) FROM ZWAGROUPMEMBER WHERE ZCHATSESSION = ? "
+                         "AND coalesce(ZISACTIVE, 1) = 1", [pk]).fetchone()[0]
+    return {"phone": None, "jid": jid, "name": clean(name), "new_chat": False, "group": True,
+            "members": members}
+
+
+def to_label(target):
+    """Who receives it, for the preview and the result line."""
+    if target["group"]:
+        return "%s (group, %d members, %s)" % (target["name"], target["members"], target["jid"])
+    return "%s (%s)" % (target["phone"], target["name"] or "new chat")
 
 
 def send_text(a):
@@ -525,6 +563,7 @@ class AX:
                 (cf.CFArrayGetTypeID, ctypes.c_ulong, []),
                 (cf.CFArrayGetCount, lng, [vp]),
                 (cf.CFArrayGetValueAtIndex, vp, [vp, lng]),
+                (cf.CFEqual, ctypes.c_bool, [vp, vp]),
                 (ax.AXIsProcessTrusted, ctypes.c_bool, []),
                 (ax.AXUIElementCreateApplication, vp, [i32]),
                 (ax.AXUIElementCopyAttributeValue, i32, [vp, vp, ctypes.POINTER(vp)]),
@@ -532,6 +571,7 @@ class AX:
                 (ax.AXUIElementSetMessagingTimeout, i32, [vp, ctypes.c_float]),
                 (ax.AXUIElementSetAttributeValue, i32, [vp, vp, vp]),
                 (ax.CGEventCreateKeyboardEvent, vp, [vp, ctypes.c_uint16, ctypes.c_bool]),
+                (ax.CGEventSetFlags, None, [vp, ctypes.c_uint64]),
                 (ax.CGEventPostToPid, None, [i32, vp])):
             fn.restype, fn.argtypes = res, args
         self.cf, self.ax = cf, ax
@@ -579,11 +619,20 @@ class AX:
         true = self.c.c_void_p.in_dll(self.cf, "kCFBooleanTrue")
         return self.ax.AXUIElementSetAttributeValue(el, self.cfstr("AXFocused"), true) == 0
 
-    def return_key(self, pid):
-        """Press Return in one app only. The key never reaches the app in front."""
+    def key(self, pid, code, command=False):
+        """Press one key in one app only. The key never reaches the app in front."""
         for down in (True, False):
-            self.ax.CGEventPostToPid(pid, self.ax.CGEventCreateKeyboardEvent(None, 36, down))
+            event = self.ax.CGEventCreateKeyboardEvent(None, code, down)
+            if command:
+                self.ax.CGEventSetFlags(event, 0x100000)  # kCGEventFlagMaskCommand
+            self.ax.CGEventPostToPid(pid, event)
             time.sleep(0.05)
+
+    def return_key(self, pid):
+        self.key(pid, 36)
+
+    def same(self, a, b):
+        return bool(a and b and self.cf.CFEqual(a, b))
 
     def walk(self, el, limit=6000):
         """Every element under el, breadth first, each with its parent chain."""
@@ -693,6 +742,8 @@ def open_chat(target, text):
                    "Nothing was sent.", AX_FIX)
     if screen_locked():
         raise Fail(3, "the Mac's screen is locked. Nothing was sent.", "unlock the Mac, then rerun")
+    if target["group"]:
+        return open_group(ax, target, text)
     url = "whatsapp://send?" + urllib.parse.urlencode(
         {"phone": target["phone"].lstrip("+"), "text": text}, quote_via=urllib.parse.quote)
     if subprocess.run(["/usr/bin/open", "-g", url], capture_output=True).returncode != 0:
@@ -717,6 +768,164 @@ def open_chat(target, text):
     raise Fail(1, "the chat did not open with the message in %ds. Nothing was sent. "
                "WhatsApp's buttons: %s" % (UI_WAIT, ", ".join(buttons[:40]) or "(no window)"),
                "open WhatsApp for Mac, check it is signed in, then rerun")
+
+
+# --- groups ---------------------------------------------------------------------------
+# No WhatsApp URL opens a chat by JID, so wa opens a group the way a person does. It
+# pastes the exact name into the chat list's search field and opens the result. It checks
+# the chat is titled with that name, then pastes the text into the empty composer. From
+# there it sends as for a person. wa borrows the clipboard for this and puts its text back.
+
+def clipboard(data=None):
+    """The clipboard's text as bytes, or set it to data (bytes)."""
+    env = {"LANG": "en_US.UTF-8", "PATH": "/usr/bin:/bin"}  # UTF-8, also under wa-launch
+    if data is None:
+        return subprocess.run(["/usr/bin/pbpaste"], capture_output=True, env=env).stdout
+    subprocess.run(["/usr/bin/pbcopy"], input=data, env=env, capture_output=True, check=True)
+
+
+def paste(ax, pid, el, text):
+    """Replace the text in el with text, the way a person pastes it.
+
+    Cmd+A and Cmd+V go to whatever WhatsApp has focused, so wa checks that is el first.
+    Otherwise they could replace the draft in another chat.
+    """
+    ax.focus(el)
+    time.sleep(0.2)
+    if not ax.same(ax.get(ax.app(pid), "AXFocusedUIElement"), el):
+        raise Fail(1, "WhatsApp did not move the cursor to its %s. Nothing was sent."
+                   % (ax.get(el, "AXRole") or "text field"), "report it at " + ISSUES)
+    clipboard(text.encode("utf-8"))
+    ax.key(pid, 0, command=True)  # Cmd+A
+    ax.key(pid, 9, command=True)  # Cmd+V
+
+
+def wait_for(probe, seconds):
+    deadline = time.time() + seconds
+    while True:
+        got = probe()
+        if got or time.time() >= deadline:
+            return got
+        time.sleep(0.4)
+
+
+def text_fields(ax, app):
+    """(element, label) of every text field and text area in WhatsApp's windows."""
+    out = []
+    for win in ax.get(app, "AXWindows") or []:
+        for el, _ in ax.walk(win, limit=3000):
+            if ax.get(el, "AXRole") in ("AXTextField", "AXTextArea", "AXSearchField"):
+                hint = ax.get(el, "AXPlaceholderValue")
+                out.append((el, clean(" ".join(filter(None, (
+                    ax.get(el, "AXRole"), ax.get(el, "AXSubrole"), ax.label(el),
+                    hint if isinstance(hint, str) else None))))))
+    return out
+
+
+def has_text(ax, el, want):
+    for attr in ("AXValue", "AXTitle", "AXDescription"):
+        value = ax.get(el, attr)
+        if isinstance(value, str) and norm(value).casefold() == want:
+            return True
+    return False
+
+
+def chat_titled(ax, composer, name, search):
+    """True when the chat around composer is titled name.
+
+    It looks for a label that reads exactly name in the nearest ancestor of the composer,
+    and stops at the first ancestor that also holds the chat list's search field, because
+    the chat list shows the name too.
+    """
+    want = norm(name).casefold()
+    for parent in reversed(ancestors(ax, composer)[-8:]):
+        hit = False
+        for el, _ in ax.walk(parent, limit=2000):
+            if ax.same(el, search):
+                return False
+            if ax.get(el, "AXRole") in ("AXStaticText", "AXButton", "AXHeading") \
+                    and has_text(ax, el, want):
+                hit = True
+        if hit:
+            return True
+    return False
+
+
+def open_composer(ax, app, search):
+    """The open chat's composer: the focused text area, else the only one in the window."""
+    focused = ax.get(app, "AXFocusedUIElement")
+    if focused and not isinstance(focused, (str, list)) and not ax.same(focused, search) \
+            and ax.get(focused, "AXRole") == "AXTextArea":
+        return focused
+    areas = [el for el, label in text_fields(ax, app)
+             if ax.get(el, "AXRole") == "AXTextArea" and not ax.same(el, search)]
+    return areas[0] if len(areas) == 1 else None
+
+
+def open_group(ax, target, text):
+    name, want = target["name"], norm(target["name"]).casefold()
+    subprocess.run(["/usr/bin/open", "-g", "-b", "net.whatsapp.WhatsApp"], capture_output=True)
+    pid = wait_for(whatsapp_pid, UI_WAIT)
+    if not pid:
+        raise Fail(3, "WhatsApp for Mac did not start. Nothing was sent.",
+                   "open WhatsApp for Mac and sign in, then rerun")
+    app = ax.app(pid)
+    fields = wait_for(lambda: text_fields(ax, app), UI_WAIT)
+    search = next((el for el, label in fields if re.search(r"search", label, re.I)), None)
+    if not search:
+        raise Fail(1, "WhatsApp changed its window: no search field in the chat list. Nothing "
+                   "was sent. Text fields: %s" % ("; ".join(l for _, l in fields) or "none"),
+                   "report it at " + ISSUES)
+    old = clipboard()
+    try:
+        paste(ax, pid, search, name)
+        if not wait_for(lambda: has_text(ax, search, want), 3):
+            raise Fail(1, "WhatsApp's search field did not take the group name. Nothing was "
+                       "sent.", "report it at " + ISSUES)
+        time.sleep(1.0)  # the results list
+        ax.return_key(pid)
+        composer = wait_for(lambda: open_composer(ax, app, search), 3)
+        if not composer or not chat_titled(ax, composer, name, search):
+            press_result(ax, app, want, search)
+            composer = wait_for(lambda: open_composer(ax, app, search), 3)
+        if not composer:
+            raise Fail(1, "the group did not open from WhatsApp's search. Nothing was sent. "
+                       "Text fields: %s" % "; ".join(l for _, l in text_fields(ax, app)),
+                       "open the group in WhatsApp, then rerun; or report it at " + ISSUES)
+        if not chat_titled(ax, composer, name, search):
+            raise Fail(1, "the chat that opened is not titled %r. Nothing was sent." % name,
+                       "open the group in WhatsApp, then rerun; or report it at " + ISSUES)
+        draft = norm(ax.get(composer, "AXValue") if isinstance(
+            ax.get(composer, "AXValue"), str) else "")
+        if draft and draft != norm(text):
+            raise Fail(2, "the group's composer already holds a draft. Nothing was sent.",
+                       "send or delete the draft in WhatsApp, then rerun")
+        if not draft:
+            paste(ax, pid, composer, text)
+        found = wait_for(lambda: (lambda f: f if f[0] else None)(find_composer(ax, pid, text)), 5)
+    finally:
+        clipboard(old)
+    composer, button = (found or (None, None))[:2]
+    if not composer or not chat_titled(ax, composer, name, search):
+        raise Fail(1, "the text did not land in the group's composer. Nothing was sent.",
+                   "check the group in WhatsApp; delete any half-pasted text")
+    if not button:
+        raise Fail(1, "WhatsApp changed its window: no Send button next to the message. "
+                   "Nothing was sent; the text is waiting in the chat.",
+                   "press Send in WhatsApp yourself, or report it at " + ISSUES)
+    return ax, pid, composer, button
+
+
+def press_result(ax, app, want, search):
+    """Press the search result that reads exactly the group name, or its row."""
+    for win in ax.get(app, "AXWindows") or []:
+        for el, up in ax.walk(win, limit=3000):
+            if ax.get(el, "AXRole") == "AXStaticText" and has_text(ax, el, want) \
+                    and not any(ax.same(u, search) for u in up):
+                for node in (el,) + tuple(reversed(up[-4:])):
+                    if ax.press(node):
+                        return True
+    return False
 
 
 def press_send(target, text, after_pk):
@@ -782,7 +991,8 @@ def read_back(after_pk, target, text, wait=None):
             if norm(body) == want:
                 return {"id": pk, "time": iso_time(date), "jid": jid,
                         "chat": clean(name or user_part(jid)),
-                        "same_chat": jid == target["jid"] or (jid or "").endswith("@lid")}
+                        "same_chat": jid == target["jid"]
+                        or (not target["group"] and (jid or "").endswith("@lid"))}
         time.sleep(1)
     return None
 
@@ -794,9 +1004,8 @@ def cmd_send(db, a):
     if a.check:
         return check_chat(target, text, out)
     if not a.yes:
-        return out, lambda o: "To:   %s (%s)\nText: %s" % (
-            o["phone"], o["name"] or "new chat",
-            "\n      ".join(clean(line) for line in o["text"].split("\n")))
+        return out, lambda o: "To:   %s\nText: %s" % (
+            to_label(o), "\n      ".join(clean(line) for line in o["text"].split("\n")))
     after = db.execute("SELECT coalesce(max(Z_PK), 0) FROM ZWAMESSAGE").fetchone()[0]
     how, got = press_send(target, text, after)
     got = got or read_back(after, target, text)
@@ -804,10 +1013,12 @@ def cmd_send(db, a):
         where = "it is not in the database after %ds" % READBACK_WAIT if not got else \
             "it showed up in %s (%s), not %s" % (got["chat"], clean(got["jid"]), target["jid"])
         raise Fail(5, "WhatsApp took the message from the composer, but %s." % where,
-                   "check the chat yourself: wa read %s -n 3" % shlex.quote(target["phone"]))
+                   "check the chat yourself: wa read %s -n 3"
+                   % shlex.quote(target["phone"] or target["jid"]))
     out = dict(out, sent=True, confirmed=True, id=got["id"], time=got["time"],
                jid=got["jid"], name=got["chat"], via=how)
-    return out, lambda o: "sent and confirmed: %s %s #%d" % (o["time"], o["phone"], o["id"])
+    return out, lambda o: "sent and confirmed: %s %s #%d" % (
+        o["time"], o["phone"] or o["name"], o["id"])
 
 
 def check_chat(target, text, out):
@@ -819,7 +1030,7 @@ def check_chat(target, text, out):
                send_button=clean(ax.label(button)), buttons=seen[:30])
     return out, lambda o: ("Ready: the message waits in the chat with %s. Nothing was sent.\n"
                            "Send button: %s\nButtons near it: %s" % (
-                               o["phone"], o["send_button"], ", ".join(o["buttons"])))
+                               to_label(o), o["send_button"], ", ".join(o["buttons"])))
 
 
 def send_guard(a, as_json):
@@ -942,6 +1153,7 @@ def build_parser():
                "  wa media 157535\n  wa status\n"
                "  wa send +6285283826458 --text-file msg.txt         # preview, sends nothing\n"
                "  wa send +6285283826458 --text-file msg.txt --yes   # send and confirm\n"
+               "  wa send 120363000001@g.us --text-file msg.txt      # a group: preview\n"
                "  WA_HOST=my-mac wa chats\n\n"
                "Status updates, broadcasts and hidden chats are skipped.\n" + ISSUES)
     p.add_argument("--version", action="version", version="wa " + VERSION)
@@ -970,7 +1182,8 @@ def build_parser():
     m.add_argument("--b64", action="store_true", help=argparse.SUPPRESS)
     w = sub.add_parser("send", parents=[common],
                        help="send one message through WhatsApp for Mac; previews without --yes")
-    w.add_argument("to", help="phone number with country code, or a direct chat's name or JID")
+    w.add_argument("to", help="phone number with country code, a direct chat's name or JID, "
+                   "or a group's exact name or JID (...@g.us)")
     body = w.add_mutually_exclusive_group(required=True)
     body.add_argument("--text", help="the message")
     body.add_argument("--text-file", metavar="FILE", help="read the message from a UTF-8 file")
