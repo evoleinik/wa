@@ -2,7 +2,7 @@
 
 **Type:** Decision doc
 **Date:** 2026-11-25
-**Status:** recommendation, waiting on a live check on air
+**Status:** B and C tested live and failed. Groups are preview only for now.
 
 ## Problem
 
@@ -18,8 +18,8 @@ is a note to a customer group ("AirShelf x Maison Mugen", `120363429758875785@g.
   strings inline, so this proves nothing either way.
 - wa-launch holds Accessibility, and runs only the root-owned copy of wa. So every live
   probe of WhatsApp's window needs a new install on air, and that needs Eugene's sudo.
-- The group's own window has a search field in the chat list, and the chat header
-  shows the group name. Not yet checked through Accessibility.
+- Live probes on air ran from Terminal, which holds Accessibility, with Eugene's OK. They
+  used only the self chat and the group that was already open. Nothing was sent.
 
 ## Criteria (fixed before ranking)
 
@@ -64,12 +64,47 @@ A composer that honours a set value (then C, with no clipboard).
 B. It is the only option where wa sees the right chat and the exact text before it
 presses anything. The clipboard cost is small, and wa restores the text it held.
 
+## Live probes (2026-11-25, WhatsApp 26.47.15, macOS 15.8.1)
+
+Worked:
+- Each chat-list row is an `AXButton`. Its `AXDescription` is the chat's exact name.
+  AXPress on it opens the chat and focuses the composer.
+- The open chat's header is the `NavigationBar_HeaderViewButton`. Its `AXDescription` is
+  the chat name and its `AXValue` lists members. The composer is
+  `ChatBar_ComposerTextView`. Labels carry U+200E marks, so strip them before comparing.
+- Return, Delete and Cmd+A posted to WhatsApp's process act on the composer. Delete and
+  Cmd+A only worked with WhatsApp in front.
+- `whatsapp://send?text=` with no phone opens a "Send to" sheet. It has checkbox rows
+  (`ForwardPicker_*_Cell_N`, described as "name, members"), a search field and Cancel.
+
+Failed, with nothing put in the composer:
+- Setting `AXValue` on the composer. It reads back, but WhatsApp's own state ignores it.
+  Clearing it this way left the Send button showing, so Return would send the old text.
+  That rules out C.
+- `AXSelectedText`, and characters posted with `CGEventKeyboardSetUnicodeString`.
+- Cmd+V posted to the process, in the background and in front. A system-wide Cmd+V with
+  WhatsApp in front. The Edit > Paste menu item pressed through Accessibility. The
+  clipboard held text in every case, and Paste was enabled. That rules out B.
+- The chat list's search field is an `AXStaticText` and does not take focus.
+- In the "Send to" sheet, neither AXPress nor a system-wide mouse click ticks a row. So
+  A cannot pick the group either.
+- Terminal passed `CGPreflightPostEventAccess`, so these failures are not a missing grant.
+
+## Outcome — 2026-11-25
+
+None of A, B or C works on WhatsApp 26.47. `wa send` previews a group message, with the
+group name and member count, and refuses `--yes` and `--check` with exit 2. A person
+still sends as before.
+
+Facts that would reopen this: a WhatsApp update that takes pasted or typed text in the
+composer, a URL that opens a chat by JID, or WhatsApp's Shortcuts "Send Message" action
+accepting a group. That last one is untested and needs a shortcut built by hand.
+
 ## Questions for Eugene
 
-1. (Side effects) Is it fine that wa borrows the clipboard for about a second during a
-   group send? Default: yes, it puts back the text that was there.
-   A clipboard manager on air would record the group name and the message text. pbcopy
-   cannot mark them as transient.
+1. (Unknowns) Should wa try WhatsApp's Shortcuts "Send Message" action for groups? It
+   needs you to build one shortcut in the Shortcuts app once. Default: no, until a group
+   send is needed again.
 
 ## Review notes (2026-11-25, automated security review)
 
@@ -78,4 +113,7 @@ presses anything. The clipboard cost is small, and wa restores the text it held.
 - The unique-name check counted only visible chats. Fixed: it counts hidden chats and
   push names too. Address-book contacts are not in this database. A contact named like
   the group would show up in search, so read-back (exit 5) is the only check there.
-- Clipboard exposure is accepted for now, as question 1 asks.
+- Clipboard exposure is moot. The clipboard path was removed after the probes.
+- The opener, title check and clipboard code were then removed, because the live probes
+  showed the text step cannot work. The member count, the unique-name check, and the
+  read-back that demands the exact group JID stay.

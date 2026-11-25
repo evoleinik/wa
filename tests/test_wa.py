@@ -634,7 +634,8 @@ class SendTest(unittest.TestCase):
             p = self.run_wa("send", to, "--text", "hi all")
             self.assertEqual(p.returncode, 0, p.stderr)
             self.assertIn("To:   Team Lunch (group, 2 members, 120363000001@g.us)", p.stdout)
-            self.assertIn("Not sent. To send it: wa send", p.stderr)
+            self.assertIn("does not send to groups yet", p.stdout)
+            self.assertNotIn("--yes", p.stderr)
         got = json.loads(self.run_wa("send", "Team Lunch", "--text", "x", "--json").stdout)
         self.assertEqual((got["group"], got["members"], got["phone"]), (True, 2, None))
 
@@ -681,43 +682,12 @@ class SendTest(unittest.TestCase):
         self.assertEqual(code, 5)
         self.assertIn("wa read 120363000001@g.us", err)
 
-    def test_group_chat_title_check_ignores_the_chat_list(self):
-        wa = load_wa()
-
-        class Node:
-            def __init__(self, role, text=None, kids=()):
-                self.role, self.text, self.kids, self.parent = role, text, list(kids), None
-                for k in self.kids:
-                    k.parent = self
-
-        class Tree:
-            def get(self, el, attr):
-                return {"AXRole": el.role, "AXValue": el.text, "AXChildren": el.kids,
-                        "AXParent": el.parent}.get(attr)
-
-            def same(self, a, b):
-                return a is b
-
-            walk = wa.AX.walk
-
-        def window(header):
-            search = Node("AXTextField", "Team Lunch")
-            composer = Node("AXTextArea", "")
-            Node("AXWindow", kids=[
-                Node("AXGroup", kids=[search, Node("AXStaticText", "Team Lunch")]),
-                Node("AXGroup", kids=[Node("AXGroup", kids=[Node("AXStaticText", header)]),
-                                      Node("AXGroup", kids=[composer])])])
-            return composer, search
-        composer, search = window("Team Lunch")
-        self.assertTrue(wa.chat_titled(Tree(), composer, "team  lunch", search))
-        composer, search = window("Alice Smith")
-        self.assertFalse(wa.chat_titled(Tree(), composer, "Team Lunch", search))
-        # A message that reads "Team Lunch" in Alice's chat is not a title.
-        composer, search = window("Alice Smith")
-        pane = composer.parent.parent
-        pane.kids.append(Node("AXScrollArea", kids=[Node("AXStaticText", "Team Lunch")]))
-        pane.kids[-1].parent = pane
-        self.assertFalse(wa.chat_titled(Tree(), composer, "Team Lunch", search))
+    def test_group_send_and_check_refuse_and_send_nothing(self):
+        for flag in ("--yes", "--check"):
+            p = self.run_wa("send", "Team Lunch", "--text", "hi", flag)
+            self.assertEqual(p.returncode, 2, flag)
+            self.assertIn("previews a group message", p.stderr)
+        self.assertFalse(os.path.exists(os.path.join(self.home, ".wa", "last-send")))
 
     def test_send_confirms_by_reading_the_message_back(self):
         code, out, err, calls = self.in_process(
